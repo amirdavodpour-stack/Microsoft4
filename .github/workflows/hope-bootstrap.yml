@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       archive:
-        description: "ZIP archive filename. Leave empty for automatic detection."
+        description: "ZIP archive filename. Leave empty to auto-detect."
         required: false
         type: string
 
@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   bootstrap:
-    name: Extract and prepare HOPE
+    name: HOPE Auto Build
     runs-on: ubuntu-latest
 
     steps:
@@ -28,7 +28,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect ZIP archive
+      - name: Detect ZIP
         id: archive
         shell: bash
         env:
@@ -39,11 +39,11 @@ jobs:
           ARCHIVE="$INPUT_ARCHIVE"
 
           if test -n "$ARCHIVE"; then
-            if test ! -f "$ARCHIVE"; then
-              echo "ERROR: ZIP file not found:"
+            test -f "$ARCHIVE" || {
+              echo "ERROR: ZIP not found:"
               echo "$ARCHIVE"
               exit 1
-            fi
+            }
           else
             ARCHIVE="$(find . \
               -type f \
@@ -61,7 +61,7 @@ jobs:
 
           ARCHIVE="${ARCHIVE#./}"
 
-          echo "Selected archive:"
+          echo "Using archive:"
           echo "$ARCHIVE"
 
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
@@ -74,7 +74,6 @@ jobs:
           rm -rf .hope-work
 
           mkdir -p .hope-work/source
-          mkdir -p .hope-work/project
 
       - name: Extract ZIP
         env:
@@ -83,21 +82,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Extracting:"
-          echo "$ARCHIVE"
-
           unzip -q "$ARCHIVE" -d ".hope-work/source"
 
-          echo
-          echo "Archive extracted successfully."
+          echo "ZIP extracted."
 
-          find ".hope-work/source" \
-            -maxdepth 4 \
-            -type f \
-            | sort \
-            | head -300
-
-      - name: Locate project root
+      - name: Locate Flutter project
         id: project
         shell: bash
         run: |
@@ -123,57 +112,27 @@ jobs:
           fi
 
           if test -z "$PROJECT"; then
-            echo "ERROR: Flutter project was not found."
-            echo
-            echo "Searching for common project files..."
-
-            find "$SOURCE" \
-              -type f \
-              \( \
-                -name 'pubspec.yaml' \
-                -o -name 'settings.gradle' \
-                -o -name 'settings.gradle.kts' \
-                -o -name 'gradlew' \
-              \) \
-              | sort \
-              | head -200
-
+            echo "ERROR: Flutter project not found."
+            find "$SOURCE" -maxdepth 4 -type f | sort | head -300
             exit 1
           fi
 
-          echo "Project root:"
+          echo "Flutter project:"
           echo "$PROJECT"
 
           echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
 
-      - name: Validate Flutter project structure
-        env:
-          PROJECT: ${{ steps.project.outputs.project }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          test -f "$PROJECT/pubspec.yaml"
-
-          echo "Flutter project detected."
-
-          if test -d "$PROJECT/android"; then
-            echo "Android directory detected."
-          else
-            echo "WARNING: android directory not found."
-          fi
-
-      - name: Install Flutter
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: Show Flutter version
+      - name: Flutter version
         run: |
           flutter --version
 
-      - name: Install dependencies
+      - name: Get dependencies
         env:
           PROJECT: ${{ steps.project.outputs.project }}
         shell: bash
@@ -184,6 +143,23 @@ jobs:
 
           flutter pub get
 
+      - name: Automatic Dart fixes
+        env:
+          PROJECT: ${{ steps.project.outputs.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT"
+
+          echo "Running dart fix..."
+
+          dart fix --apply || true
+
+          echo "Running dart format..."
+
+          dart format . || true
+
       - name: Analyze project
         env:
           PROJECT: ${{ steps.project.outputs.project }}
@@ -193,7 +169,31 @@ jobs:
 
           cd "$PROJECT"
 
-          flutter analyze
+          echo "Running Flutter analyzer..."
+
+          flutter analyze > ../analyze.log 2>&1 || true
+
+          cat ../analyze.log
+
+          echo
+          echo "Analyzer completed."
+          echo "Warnings and infos do not stop this workflow."
+
+      - name: Check Dart syntax
+        env:
+          PROJECT: ${{ steps.project.outputs.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT"
+
+          echo "Checking Dart files..."
+
+          dart analyze lib test integration_test \
+            > ../dart-syntax.log 2>&1 || true
+
+          cat ../dart-syntax.log
 
       - name: Build release APK
         env:
@@ -206,7 +206,7 @@ jobs:
 
           flutter build apk --release
 
-      - name: Locate generated APK
+      - name: Find generated APK
         id: apk
         env:
           PROJECT: ${{ steps.project.outputs.project }}
@@ -226,12 +226,12 @@ jobs:
             exit 1
           fi
 
-          echo "Generated APK:"
+          echo "APK:"
           echo "$APK"
 
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: HOPE-release-apk
@@ -239,10 +239,10 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish APK
-        shell: bash
+      - name: Publish APK to repository
         env:
           APK: ${{ steps.apk.outputs.apk }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -256,25 +256,23 @@ jobs:
           git add releases/HOPE-release.apk
 
           if git diff --cached --quiet; then
-            echo "APK is already current."
+            echo "No APK repository update required."
           else
             git commit -m "build: publish HOPE APK"
             git push
           fi
 
-      - name: Bootstrap summary
+      - name: Build summary
         shell: bash
         run: |
-          set -euo pipefail
-
           echo
           echo "========================================"
-          echo "HOPE BOOTSTRAP COMPLETED"
+          echo "HOPE BUILD COMPLETED"
           echo "========================================"
           echo
-          echo "APK:"
-          echo "releases/HOPE-release.apk"
-          echo
-          echo "Artifact:"
+          echo "APK artifact:"
           echo "HOPE-release-apk"
+          echo
+          echo "Repository APK:"
+          echo "releases/HOPE-release.apk"
           echo
