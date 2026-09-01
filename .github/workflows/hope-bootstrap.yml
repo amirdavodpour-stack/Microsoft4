@@ -1,0 +1,280 @@
+name: HOPE Bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      archive:
+        description: "ZIP archive filename. Leave empty for automatic detection."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: hope-bootstrap-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    name: Extract and prepare HOPE
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect ZIP archive
+        id: archive
+        shell: bash
+        env:
+          INPUT_ARCHIVE: ${{ inputs.archive }}
+        run: |
+          set -euo pipefail
+
+          ARCHIVE="$INPUT_ARCHIVE"
+
+          if test -n "$ARCHIVE"; then
+            if test ! -f "$ARCHIVE"; then
+              echo "ERROR: ZIP file not found:"
+              echo "$ARCHIVE"
+              exit 1
+            fi
+          else
+            ARCHIVE="$(find . \
+              -type f \
+              -iname '*.zip' \
+              ! -path './.git/*' \
+              -print \
+              | sort \
+              | head -n 1)"
+
+            if test -z "$ARCHIVE"; then
+              echo "ERROR: No ZIP archive found."
+              exit 1
+            fi
+          fi
+
+          ARCHIVE="${ARCHIVE#./}"
+
+          echo "Selected archive:"
+          echo "$ARCHIVE"
+
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf .hope-work
+
+          mkdir -p .hope-work/source
+          mkdir -p .hope-work/project
+
+      - name: Extract ZIP
+        env:
+          ARCHIVE: ${{ steps.archive.outputs.archive }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Extracting:"
+          echo "$ARCHIVE"
+
+          unzip -q "$ARCHIVE" -d ".hope-work/source"
+
+          echo
+          echo "Archive extracted successfully."
+
+          find ".hope-work/source" \
+            -maxdepth 4 \
+            -type f \
+            | sort \
+            | head -300
+
+      - name: Locate project root
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE=".hope-work/source"
+          PROJECT=""
+
+          if test -f "$SOURCE/pubspec.yaml"; then
+            PROJECT="$SOURCE"
+          else
+            PUBSPEC="$(find "$SOURCE" \
+              -type f \
+              -name 'pubspec.yaml' \
+              ! -path '*/.dart_tool/*' \
+              -print \
+              | sort \
+              | head -n 1)"
+
+            if test -n "$PUBSPEC"; then
+              PROJECT="$(dirname "$PUBSPEC")"
+            fi
+          fi
+
+          if test -z "$PROJECT"; then
+            echo "ERROR: Flutter project was not found."
+            echo
+            echo "Searching for common project files..."
+
+            find "$SOURCE" \
+              -type f \
+              \( \
+                -name 'pubspec.yaml' \
+                -o -name 'settings.gradle' \
+                -o -name 'settings.gradle.kts' \
+                -o -name 'gradlew' \
+              \) \
+              | sort \
+              | head -200
+
+            exit 1
+          fi
+
+          echo "Project root:"
+          echo "$PROJECT"
+
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Flutter project structure
+        env:
+          PROJECT: ${{ steps.project.outputs.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f "$PROJECT/pubspec.yaml"
+
+          echo "Flutter project detected."
+
+          if test -d "$PROJECT/android"; then
+            echo "Android directory detected."
+          else
+            echo "WARNING: android directory not found."
+          fi
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Show Flutter version
+        run: |
+          flutter --version
+
+      - name: Install dependencies
+        env:
+          PROJECT: ${{ steps.project.outputs.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT"
+
+          flutter pub get
+
+      - name: Analyze project
+        env:
+          PROJECT: ${{ steps.project.outputs.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT"
+
+          flutter analyze
+
+      - name: Build release APK
+        env:
+          PROJECT: ${{ steps.project.outputs.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT"
+
+          flutter build apk --release
+
+      - name: Locate generated APK
+        id: apk
+        env:
+          PROJECT: ${{ steps.project.outputs.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$(find "$PROJECT/build/app/outputs" \
+            -type f \
+            -name '*.apk' \
+            -print \
+            | sort \
+            | head -n 1)"
+
+          if test -z "$APK"; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
+          echo "Generated APK:"
+          echo "$APK"
+
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-release-apk
+          path: ${{ steps.apk.outputs.apk }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish APK
+        shell: bash
+        env:
+          APK: ${{ steps.apk.outputs.apk }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p releases
+
+          cp "$APK" "releases/HOPE-release.apk"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add releases/HOPE-release.apk
+
+          if git diff --cached --quiet; then
+            echo "APK is already current."
+          else
+            git commit -m "build: publish HOPE APK"
+            git push
+          fi
+
+      - name: Bootstrap summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo
+          echo "========================================"
+          echo "HOPE BOOTSTRAP COMPLETED"
+          echo "========================================"
+          echo
+          echo "APK:"
+          echo "releases/HOPE-release.apk"
+          echo
+          echo "Artifact:"
+          echo "HOPE-release-apk"
+          echo
