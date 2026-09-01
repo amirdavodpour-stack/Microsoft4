@@ -1,16 +1,16 @@
-name: HOPE Bootstrap
+name: HOPE ZIP Bootstrap
 
 on:
   workflow_dispatch:
     inputs:
       archive:
-        description: "ZIP archive filename. Leave empty to auto-detect."
+        description: "ZIP filename in repository. Leave empty to auto-detect."
         required: false
         type: string
 
       build_profile:
-        description: "HOPE build profile"
-        required: false
+        description: "Build profile"
+        required: true
         type: choice
         default: production
         options:
@@ -19,25 +19,33 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 concurrency:
-  group: hope-bootstrap-${{ github.repository }}
+  group: hope-zip-bootstrap-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
-  bootstrap:
-    name: HOPE Auto Build
-    runs-on: ubuntu-latest
+  build:
+    name: HOPE ZIP Auto Build
+    runs-on: ubuntu-24.04
+
+    env:
+      CI_ZIP_BUILD: "true"
 
     steps:
 
+      # ------------------------------------------------------------
+      # 1. Checkout outer repository
+      # ------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Detect ZIP
+      # ------------------------------------------------------------
+      # 2. Find ZIP
+      # ------------------------------------------------------------
+      - name: Find ZIP archive
         id: archive
         shell: bash
         env:
@@ -45,36 +53,45 @@ jobs:
         run: |
           set -euo pipefail
 
-          ARCHIVE="$INPUT_ARCHIVE"
+          ARCHIVE="${INPUT_ARCHIVE:-}"
 
-          if test -n "$ARCHIVE"; then
-            if test ! -f "$ARCHIVE"; then
-              echo "ERROR: ZIP not found:"
+          if [ -n "$ARCHIVE" ]; then
+            if [ ! -f "$ARCHIVE" ]; then
+              echo "ERROR: Requested ZIP does not exist:"
               echo "$ARCHIVE"
               exit 1
             fi
           else
-            ARCHIVE="$(find . \
-              -type f \
-              -iname '*.zip' \
-              ! -path './.git/*' \
-              -print \
+            ARCHIVE="$(
+              find . \
+                -type f \
+                \( -iname '*.zip' \) \
+                ! -path './.git/*' \
+                ! -path './.hope-work/*' \
+                -print \
               | sort \
-              | head -n 1)"
+              | head -n 1
+            )"
 
-            if test -z "$ARCHIVE"; then
-              echo "ERROR: No ZIP archive found."
+            if [ -z "$ARCHIVE" ]; then
+              echo "ERROR: No ZIP archive found in repository."
+              echo
+              echo "ZIP files found:"
+              find . -type f -iname '*.zip' ! -path './.git/*' -print || true
               exit 1
             fi
           fi
 
           ARCHIVE="${ARCHIVE#./}"
 
-          echo "Using ZIP:"
+          echo "Selected archive:"
           echo "$ARCHIVE"
 
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
+      # ------------------------------------------------------------
+      # 3. Prepare isolated source workspace
+      # ------------------------------------------------------------
       - name: Prepare workspace
         shell: bash
         run: |
@@ -83,18 +100,24 @@ jobs:
           rm -rf .hope-work
           mkdir -p .hope-work/source
 
-      - name: Extract ZIP
+      # ------------------------------------------------------------
+      # 4. Extract ZIP
+      # ------------------------------------------------------------
+      - name: Extract source ZIP
+        shell: bash
         env:
           ARCHIVE: ${{ steps.archive.outputs.archive }}
-        shell: bash
         run: |
           set -euo pipefail
 
           unzip -q "$ARCHIVE" -d ".hope-work/source"
 
-          echo "ZIP extracted successfully."
+          echo "ZIP extraction completed."
 
-      - name: Locate Flutter project
+      # ------------------------------------------------------------
+      # 5. Find Flutter project
+      # ------------------------------------------------------------
+      - name: Find Flutter project
         id: project
         shell: bash
         run: |
@@ -103,24 +126,28 @@ jobs:
           SOURCE=".hope-work/source"
           PROJECT=""
 
-          if test -f "$SOURCE/pubspec.yaml"; then
+          if [ -f "$SOURCE/pubspec.yaml" ]; then
             PROJECT="$SOURCE"
           else
-            PUBSPEC="$(find "$SOURCE" \
-              -type f \
-              -name 'pubspec.yaml' \
-              ! -path '*/.dart_tool/*' \
-              -print \
+            PUBSPEC="$(
+              find "$SOURCE" \
+                -type f \
+                -name 'pubspec.yaml' \
+                ! -path '*/.dart_tool/*' \
+                -print \
               | sort \
-              | head -n 1)"
+              | head -n 1
+            )"
 
-            if test -n "$PUBSPEC"; then
+            if [ -n "$PUBSPEC" ]; then
               PROJECT="$(dirname "$PUBSPEC")"
             fi
           fi
 
-          if test -z "$PROJECT"; then
-            echo "ERROR: Flutter project not found."
+          if [ -z "$PROJECT" ]; then
+            echo "ERROR: Could not find pubspec.yaml."
+            echo
+            echo "Extracted files:"
             find "$SOURCE" -maxdepth 4 -type f | sort | head -300
             exit 1
           fi
@@ -130,13 +157,20 @@ jobs:
 
           echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
 
+      # ------------------------------------------------------------
+      # 6. Setup Flutter
+      # ------------------------------------------------------------
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: Show versions
+      # ------------------------------------------------------------
+      # 7. Show versions
+      # ------------------------------------------------------------
+      - name: Show tool versions
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -144,209 +178,435 @@ jobs:
           dart --version
           java -version
 
-      - name: Get dependencies
+      # ------------------------------------------------------------
+      # 8. Configure ZIP build mode
+      # ------------------------------------------------------------
+      - name: Configure build environment
+        shell: bash
         env:
           PROJECT: ${{ steps.project.outputs.project }}
-        shell: bash
+          BUILD_PROFILE_INPUT: ${{ inputs.build_profile }}
         run: |
           set -euo pipefail
 
-          cd "$PROJECT"
+          if [ "$BUILD_PROFILE_INPUT" != "production" ] &&
+             [ "$BUILD_PROFILE_INPUT" != "pilot" ]; then
+            echo "ERROR: Invalid build profile."
+            exit 1
+          fi
+
+          {
+            echo "PROJECT_DIR=$PROJECT"
+            echo "BUILD_PROFILE=$BUILD_PROFILE_INPUT"
+            echo "CI_ZIP_BUILD=true"
+          } >> "$GITHUB_ENV"
+
+          echo "PROJECT_DIR=$PROJECT"
+          echo "BUILD_PROFILE=$BUILD_PROFILE_INPUT"
+          echo "CI_ZIP_BUILD=true"
+
+      # ------------------------------------------------------------
+      # 9. Dependencies
+      # ------------------------------------------------------------
+      - name: Flutter pub get
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
           flutter pub get
 
-      - name: Apply safe Dart fixes
-        env:
-          PROJECT: ${{ steps.project.outputs.project }}
+      # ------------------------------------------------------------
+      # 10. Repair generated localization if required
+      # ------------------------------------------------------------
+      - name: Refresh generated localization
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -euo pipefail
 
-          cd "$PROJECT"
+          if [ -f "tools/generate_localization.sh" ]; then
+            chmod +x tools/generate_localization.sh
+            ./tools/generate_localization.sh
+          else
+            echo "Localization generator not present; continuing."
+          fi
 
-          dart fix --apply || true
+      # ------------------------------------------------------------
+      # 11. Dart formatting
+      # ------------------------------------------------------------
+      - name: Format Dart source
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
           dart format lib test integration_test || true
 
-      - name: Configure Gradle compatibility
-        env:
-          PROJECT: ${{ steps.project.outputs.project }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ANDROID="$PROJECT/android"
-          PROPERTIES="$ANDROID/gradle.properties"
-          WRAPPER="$ANDROID/gradle/wrapper/gradle-wrapper.properties"
-
-          if test ! -d "$ANDROID"; then
-            echo "ERROR: Android directory not found."
-            exit 1
-          fi
-
-          if test ! -f "$WRAPPER"; then
-            echo "ERROR: Gradle wrapper properties not found."
-            exit 1
-          fi
-
-          touch "$PROPERTIES"
-
-          if grep -q '^android.newDsl=' "$PROPERTIES"; then
-            sed -i 's/^android.newDsl=.*/android.newDsl=false/' "$PROPERTIES"
-          else
-            printf '%s\n' 'android.newDsl=false' >> "$PROPERTIES"
-          fi
-
-          if grep -q '^android.builtInKotlin=' "$PROPERTIES"; then
-            sed -i 's/^android.builtInKotlin=.*/android.builtInKotlin=false/' "$PROPERTIES"
-          else
-            printf '%s\n' 'android.builtInKotlin=false' >> "$PROPERTIES"
-          fi
-
-          sed -i \
-            -E 's#gradle-[0-9]+\.[0-9]+(\.[0-9]+)?-bin\.zip#gradle-8.14-bin.zip#' \
-            "$WRAPPER"
-
-          if grep -q '^distributionSha256Sum=' "$WRAPPER"; then
-            sed -i \
-              's/^distributionSha256Sum=.*/distributionSha256Sum=61ad310d3c7d3e5da131b76bbf22b5a4c0786e9d892dae8c1658d4b484de3caa/' \
-              "$WRAPPER"
-          else
-            printf '%s\n' \
-              'distributionSha256Sum=61ad310d3c7d3e5da131b76bbf22b5a4c0786e9d892dae8c1658d4b484de3caa' \
-              >> "$WRAPPER"
-          fi
-
-          echo
-          echo "===== gradle.properties ====="
-          cat "$PROPERTIES"
-
-          echo
-          echo "===== gradle-wrapper.properties ====="
-          cat "$WRAPPER"
-
-      - name: Verify Gradle wrapper
-        env:
-          PROJECT: ${{ steps.project.outputs.project }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "$PROJECT/android"
-
-          chmod +x ./gradlew
-
-          ./gradlew --version
-
+      # ------------------------------------------------------------
+      # 12. Analyzer
+      #     Analyzer findings are reported but do not hide compiler errors.
+      # ------------------------------------------------------------
       - name: Analyze Dart
-        env:
-          PROJECT: ${{ steps.project.outputs.project }}
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set +e
-
-          cd "$PROJECT"
 
           flutter analyze
 
           STATUS=$?
 
-          if test "$STATUS" -ne 0; then
+          if [ "$STATUS" -ne 0 ]; then
             echo
-            echo "WARNING: Analyzer reported issues."
-            echo "Build will continue."
+            echo "WARNING: Flutter analyzer reported issues."
+            echo "The Android compiler/build will still run."
           fi
 
           exit 0
 
-      - name: Build release APK
-        env:
-          PROJECT: ${{ steps.project.outputs.project }}
-          BUILD_PROFILE: ${{ inputs.build_profile }}
+      # ------------------------------------------------------------
+      # 13. Configure Android Gradle compatibility
+      # ------------------------------------------------------------
+      - name: Configure Android Gradle
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -euo pipefail
 
-          cd "$PROJECT"
+          ANDROID_DIR="android"
+          GRADLE_PROPERTIES="$ANDROID_DIR/gradle.properties"
+          WRAPPER_PROPERTIES="$ANDROID_DIR/gradle/wrapper/gradle-wrapper.properties"
 
-          echo "BUILD_PROFILE=$BUILD_PROFILE"
+          test -d "$ANDROID_DIR"
+          test -f "$WRAPPER_PROPERTIES"
 
-          if test "$BUILD_PROFILE" != "production" &&
-             test "$BUILD_PROFILE" != "pilot"; then
-            echo "ERROR: BUILD_PROFILE must be production or pilot."
+          touch "$GRADLE_PROPERTIES"
+
+          # Flutter currently requires at least Gradle 8.14
+          sed -i \
+            -E 's#gradle-[0-9]+\.[0-9]+(\.[0-9]+)?-bin\.zip#gradle-8.14-bin.zip#' \
+            "$WRAPPER_PROPERTIES"
+
+          # Official SHA-256 for Gradle 8.14 binary distribution.
+          GRADLE_SHA256="61ad310d3c7d3e5da131b76bbf22b5a4c0786e9d892dae8c1658d4b484de3caa"
+
+          if grep -q '^distributionSha256Sum=' "$WRAPPER_PROPERTIES"; then
+            sed -i \
+              "s/^distributionSha256Sum=.*/distributionSha256Sum=$GRADLE_SHA256/" \
+              "$WRAPPER_PROPERTIES"
+          else
+            printf '%s\n' \
+              "distributionSha256Sum=$GRADLE_SHA256" \
+              >> "$WRAPPER_PROPERTIES"
+          fi
+
+          # Keep the current project on the legacy Android DSL while
+          # AGP 9 migration is not part of this bootstrap build.
+          if grep -q '^android.newDsl=' "$GRADLE_PROPERTIES"; then
+            sed -i \
+              's/^android.newDsl=.*/android.newDsl=false/' \
+              "$GRADLE_PROPERTIES"
+          else
+            printf '%s\n' 'android.newDsl=false' >> "$GRADLE_PROPERTIES"
+          fi
+
+          if grep -q '^android.builtInKotlin=' "$GRADLE_PROPERTIES"; then
+            sed -i \
+              's/^android.builtInKotlin=.*/android.builtInKotlin=false/' \
+              "$GRADLE_PROPERTIES"
+          else
+            printf '%s\n' 'android.builtInKotlin=false' >> "$GRADLE_PROPERTIES"
+          fi
+
+          echo
+          echo "===== Gradle wrapper ====="
+          cat "$WRAPPER_PROPERTIES"
+
+          echo
+          echo "===== Gradle properties ====="
+          cat "$GRADLE_PROPERTIES"
+
+      # ------------------------------------------------------------
+      # 14. Verify Gradle
+      # ------------------------------------------------------------
+      - name: Verify Gradle wrapper
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x android/gradlew
+
+          ./android/gradlew --version
+
+      # ------------------------------------------------------------
+      # 15. Production signing setup
+      #
+      # IMPORTANT:
+      # The actual project expects:
+      #
+      # ANDROID_RELEASE_STORE_FILE
+      # ANDROID_RELEASE_STORE_PASSWORD
+      # ANDROID_RELEASE_KEY_ALIAS
+      # ANDROID_RELEASE_KEY_PASSWORD
+      #
+      # The repository's existing release workflow uses:
+      # ANDROID_RELEASE_KEYSTORE_B64
+      # ------------------------------------------------------------
+      - name: Configure production signing
+        if: env.BUILD_PROFILE == 'production'
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${KEYSTORE_B64:-}" ]; then
+            echo "ERROR: Missing GitHub repository secret:"
+            echo "ANDROID_RELEASE_KEYSTORE_B64"
+            echo
+            echo "Production builds intentionally fail closed without a release keystore."
             exit 1
           fi
+
+          KEYSTORE_PATH="$RUNNER_TEMP/hope-release.jks"
+
+          printf '%s' "$KEYSTORE_B64" \
+            | base64 --decode \
+            > "$KEYSTORE_PATH"
+
+          chmod 600 "$KEYSTORE_PATH"
+
+          if [ ! -s "$KEYSTORE_PATH" ]; then
+            echo "ERROR: Decoded release keystore is empty."
+            exit 1
+          fi
+
+          echo "ANDROID_RELEASE_STORE_FILE=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+
+          echo "Production keystore prepared in runner temporary storage."
+
+      # ------------------------------------------------------------
+      # 16. Verify production signing configuration
+      # ------------------------------------------------------------
+      - name: Verify production signing secrets
+        if: env.BUILD_PROFILE == 'production'
+        shell: bash
+        env:
+          STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${STORE_PASSWORD:-}" ]; then
+            echo "ERROR: Missing ANDROID_RELEASE_STORE_PASSWORD"
+            exit 1
+          fi
+
+          if [ -z "${KEY_ALIAS:-}" ]; then
+            echo "ERROR: Missing ANDROID_RELEASE_KEY_ALIAS"
+            exit 1
+          fi
+
+          if [ -z "${KEY_PASSWORD:-}" ]; then
+            echo "ERROR: Missing ANDROID_RELEASE_KEY_PASSWORD"
+            exit 1
+          fi
+
+          test -n "${ANDROID_RELEASE_STORE_FILE:-}"
+          test -f "$ANDROID_RELEASE_STORE_FILE"
+
+          echo "Release signing configuration is present."
+
+      # ------------------------------------------------------------
+      # 17. Build APK
+      #
+      # We intentionally use the project's own release helper when it
+      # exists because the repaired project already defines its release
+      # build contract there.
+      # ------------------------------------------------------------
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        env:
+          BUILD_PROFILE: ${{ env.BUILD_PROFILE }}
+          ANDROID_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
+          ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+          ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "HOPE Android Release Build"
+          echo "BUILD_PROFILE=$BUILD_PROFILE"
+          echo "========================================"
 
           flutter clean
           flutter pub get
 
-          export BUILD_PROFILE="$BUILD_PROFILE"
+          if [ -f "tools/build_apk_release.sh" ]; then
+            chmod +x tools/build_apk_release.sh
+            ./tools/build_apk_release.sh
+          else
+            flutter build apk --release
+          fi
 
-          flutter build apk --release
-
-      - name: Locate generated APK
+      # ------------------------------------------------------------
+      # 18. Locate APK
+      # ------------------------------------------------------------
+      - name: Locate APK
         id: apk
-        env:
-          PROJECT: ${{ steps.project.outputs.project }}
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -euo pipefail
 
-          APK="$(find "$PROJECT/build/app/outputs" \
-            -type f \
-            -name '*.apk' \
-            -print \
-            | sort \
-            | head -n 1)"
+          APK=""
 
-          if test -z "$APK"; then
+          if [ -f "build/app/outputs/flutter-apk/app-release.apk" ]; then
+            APK="build/app/outputs/flutter-apk/app-release.apk"
+          else
+            APK="$(
+              find build/app/outputs \
+                -type f \
+                -name '*.apk' \
+                -print \
+              | sort \
+              | head -n 1
+            )"
+          fi
+
+          if [ -z "$APK" ]; then
             echo "ERROR: APK was not generated."
+            echo
+            echo "Available Android output files:"
+            find build/app/outputs -type f -maxdepth 8 -print 2>/dev/null || true
             exit 1
           fi
 
-          echo "Generated APK:"
-          echo "$APK"
+          test -s "$APK"
 
+          echo "APK=$APK"
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
 
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: HOPE-release-apk
-          path: ${{ steps.apk.outputs.apk }}
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Publish APK
+      # ------------------------------------------------------------
+      # 19. APK checksum
+      # ------------------------------------------------------------
+      - name: Generate APK checksum
+        working-directory: ${{ env.PROJECT_DIR }}
         env:
           APK: ${{ steps.apk.outputs.apk }}
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p releases
+          sha256sum "$APK" > "$APK.sha256"
 
-          cp "$APK" "releases/HOPE-release.apk"
+          cat "$APK.sha256"
+
+      # ------------------------------------------------------------
+      # 20. Verify APK signature
+      # ------------------------------------------------------------
+      - name: Verify APK signature
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          APK: ${{ steps.apk.outputs.apk }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if command -v apksigner >/dev/null 2>&1; then
+            apksigner verify --verbose "$APK"
+          else
+            echo "WARNING: apksigner unavailable on runner."
+            echo "Continuing because Flutter successfully generated the APK."
+          fi
+
+      # ------------------------------------------------------------
+      # 21. Upload final APK
+      # ------------------------------------------------------------
+      - name: Upload HOPE APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-${{ env.BUILD_PROFILE }}-${{ github.run_number }}
+          path: |
+            ${{ env.PROJECT_DIR }}/${{ steps.apk.outputs.apk }}
+            ${{ env.PROJECT_DIR }}/${{ steps.apk.outputs.apk }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      # ------------------------------------------------------------
+      # 22. Copy APK to repository releases/
+      # ------------------------------------------------------------
+      - name: Publish APK to repository
+        if: env.BUILD_PROFILE == 'production'
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          APK: ${{ steps.apk.outputs.apk }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/releases"
+
+          cp "$APK" \
+            "$GITHUB_WORKSPACE/releases/HOPE-release.apk"
+
+          cp "$APK.sha256" \
+            "$GITHUB_WORKSPACE/releases/HOPE-release.apk.sha256"
+
+      # ------------------------------------------------------------
+      # 23. Commit APK
+      # ------------------------------------------------------------
+      - name: Commit production APK
+        if: env.BUILD_PROFILE == 'production'
+        shell: bash
+        run: |
+          set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add releases/HOPE-release.apk
+          git add releases/HOPE-release.apk.sha256
 
           if git diff --cached --quiet; then
-            echo "No repository update required."
+            echo "No repository changes to commit."
           else
-            git commit -m "build: publish HOPE APK"
+            git commit -m "build: publish HOPE production APK"
             git push
           fi
 
-      - name: Final summary
+      # ------------------------------------------------------------
+      # 24. Cleanup signing material
+      # ------------------------------------------------------------
+      - name: Cleanup production keystore
+        if: ${{ always() && env.ANDROID_RELEASE_STORE_FILE != '' }}
+        shell: bash
+        env:
+          KEYSTORE_PATH: ${{ env.ANDROID_RELEASE_STORE_FILE }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${KEYSTORE_PATH:-}" ] &&
+             [ -f "$KEYSTORE_PATH" ]; then
+            rm -f -- "$KEYSTORE_PATH"
+            echo "Temporary release keystore removed."
+          fi
+
+      # ------------------------------------------------------------
+      # 25. Final summary
+      # ------------------------------------------------------------
+      - name: Build summary
+        if: always()
+        shell: bash
         run: |
           echo
           echo "========================================"
-          echo "HOPE BUILD PIPELINE FINISHED"
+          echo "HOPE ZIP BOOTSTRAP"
           echo "========================================"
-          echo
-          echo "Build profile: ${{ inputs.build_profile }}"
-          echo "Artifact: HOPE-release-apk"
-          echo "APK: releases/HOPE-release.apk"
-          echo
+          echo "Profile : ${{ env.BUILD_PROFILE }}"
+          echo "Artifact: HOPE-${{ env.BUILD_PROFILE }}-${{ github.run_number }}"
+          echo "========================================"
