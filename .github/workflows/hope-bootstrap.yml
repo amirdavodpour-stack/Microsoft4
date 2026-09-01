@@ -127,7 +127,7 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Show tool versions
+      - name: Show versions
         run: |
           set -euo pipefail
 
@@ -158,7 +158,7 @@ jobs:
           dart fix --apply || true
           dart format lib test integration_test || true
 
-      - name: Configure Android compatibility
+      - name: Configure Gradle compatibility
         env:
           PROJECT: ${{ steps.project.outputs.project }}
         shell: bash
@@ -166,57 +166,63 @@ jobs:
           set -euo pipefail
 
           ANDROID="$PROJECT/android"
+          PROPERTIES="$ANDROID/gradle.properties"
+          WRAPPER="$ANDROID/gradle/wrapper/gradle-wrapper.properties"
 
           if test ! -d "$ANDROID"; then
-            echo "ERROR: Android directory not found:"
-            echo "$ANDROID"
+            echo "ERROR: Android directory not found."
             exit 1
           fi
 
-          GRADLE_PROPERTIES="$ANDROID/gradle.properties"
-          WRAPPER_PROPERTIES="$ANDROID/gradle/wrapper/gradle-wrapper.properties"
-
-          touch "$GRADLE_PROPERTIES"
-
-          echo "Configuring AGP 9 compatibility flags..."
-
-          if grep -q '^android.newDsl=' "$GRADLE_PROPERTIES"; then
-            sed -i 's/^android.newDsl=.*/android.newDsl=false/' "$GRADLE_PROPERTIES"
-          else
-            printf '\nandroid.newDsl=false\n' >> "$GRADLE_PROPERTIES"
+          if test ! -f "$WRAPPER"; then
+            echo "ERROR: Gradle wrapper properties not found."
+            echo "$WRAPPER"
+            exit 1
           fi
 
-          if grep -q '^android.builtInKotlin=' "$GRADLE_PROPERTIES"; then
-            sed -i 's/^android.builtInKotlin=.*/android.builtInKotlin=false/' "$GRADLE_PROPERTIES"
+          touch "$PROPERTIES"
+
+          echo "Configuring Android compatibility..."
+
+          if grep -q '^android.newDsl=' "$PROPERTIES"; then
+            sed -i 's/^android.newDsl=.*/android.newDsl=false/' "$PROPERTIES"
           else
-            printf 'android.builtInKotlin=false\n' >> "$GRADLE_PROPERTIES"
+            printf '%s\n' 'android.newDsl=false' >> "$PROPERTIES"
+          fi
+
+          if grep -q '^android.builtInKotlin=' "$PROPERTIES"; then
+            sed -i 's/^android.builtInKotlin=.*/android.builtInKotlin=false/' "$PROPERTIES"
+          else
+            printf '%s\n' 'android.builtInKotlin=false' >> "$PROPERTIES"
+          fi
+
+          echo "Updating Gradle wrapper to 8.14..."
+
+          sed -i \
+            -E 's#gradle-[0-9]+\.[0-9]+(\.[0-9]+)?-bin\.zip#gradle-8.14-bin.zip#' \
+            "$WRAPPER"
+
+          echo "Updating official Gradle SHA-256..."
+
+          if grep -q '^distributionSha256Sum=' "$WRAPPER"; then
+            sed -i \
+              's/^distributionSha256Sum=.*/distributionSha256Sum=61ad310d3c7d3e5da131b76bbf22b5a4c0786e9d892dae8c1658d4b484de3caa/' \
+              "$WRAPPER"
+          else
+            printf '%s\n' \
+              'distributionSha256Sum=61ad310d3c7d3e5da131b76bbf22b5a4c0786e9d892dae8c1658d4b484de3caa' \
+              >> "$WRAPPER"
           fi
 
           echo
-          echo "gradle.properties:"
-          cat "$GRADLE_PROPERTIES"
+          echo "===== gradle.properties ====="
+          cat "$PROPERTIES"
 
-          if test -f "$WRAPPER_PROPERTIES"; then
+          echo
+          echo "===== gradle-wrapper.properties ====="
+          cat "$WRAPPER"
 
-            echo
-            echo "Current Gradle wrapper:"
-            grep '^distributionUrl=' "$WRAPPER_PROPERTIES" || true
-
-            sed -i \
-              -E 's#gradle-[0-9]+\.[0-9]+(\.[0-9]+)?-#gradle-8.14-#' \
-              "$WRAPPER_PROPERTIES"
-
-            echo
-            echo "Updated Gradle wrapper:"
-            grep '^distributionUrl=' "$WRAPPER_PROPERTIES" || true
-
-          else
-            echo "ERROR: Gradle wrapper properties not found:"
-            echo "$WRAPPER_PROPERTIES"
-            exit 1
-          fi
-
-      - name: Verify Gradle version
+      - name: Verify Gradle wrapper
         env:
           PROJECT: ${{ steps.project.outputs.project }}
         shell: bash
@@ -229,28 +235,23 @@ jobs:
 
           ./gradlew --version
 
-      - name: Run Flutter analyzer
+      - name: Analyze Dart
         env:
           PROJECT: ${{ steps.project.outputs.project }}
         shell: bash
         run: |
-          set -u
+          set +e
 
           cd "$PROJECT"
 
-          echo "Running Flutter analyzer..."
-
-          flutter analyze \
-            > ../flutter-analyze.log 2>&1
+          flutter analyze
 
           STATUS=$?
 
-          cat ../flutter-analyze.log
-
           if test "$STATUS" -ne 0; then
             echo
-            echo "Analyzer found issues."
-            echo "Build will still be attempted so compiler errors can be identified."
+            echo "WARNING: Analyzer reported issues."
+            echo "The build will continue so compiler/build errors can be identified."
           fi
 
           exit 0
@@ -319,20 +320,19 @@ jobs:
           git add releases/HOPE-release.apk
 
           if git diff --cached --quiet; then
-            echo "No APK repository update required."
+            echo "No repository update required."
           else
             git commit -m "build: publish HOPE APK"
             git push
           fi
 
       - name: Final summary
-        shell: bash
         run: |
           echo
           echo "========================================"
-          echo "HOPE BOOTSTRAP FINISHED"
+          echo "HOPE BUILD PIPELINE FINISHED"
           echo "========================================"
           echo
           echo "Artifact: HOPE-release-apk"
-          echo "Repository file: releases/HOPE-release.apk"
+          echo "APK: releases/HOPE-release.apk"
           echo
