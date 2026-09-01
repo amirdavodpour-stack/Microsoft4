@@ -39,11 +39,11 @@ jobs:
           ARCHIVE="$INPUT_ARCHIVE"
 
           if test -n "$ARCHIVE"; then
-            test -f "$ARCHIVE" || {
+            if test ! -f "$ARCHIVE"; then
               echo "ERROR: ZIP not found:"
               echo "$ARCHIVE"
               exit 1
-            }
+            fi
           else
             ARCHIVE="$(find . \
               -type f \
@@ -61,7 +61,7 @@ jobs:
 
           ARCHIVE="${ARCHIVE#./}"
 
-          echo "Using archive:"
+          echo "Using ZIP:"
           echo "$ARCHIVE"
 
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
@@ -72,7 +72,6 @@ jobs:
           set -euo pipefail
 
           rm -rf .hope-work
-
           mkdir -p .hope-work/source
 
       - name: Extract ZIP
@@ -84,7 +83,7 @@ jobs:
 
           unzip -q "$ARCHIVE" -d ".hope-work/source"
 
-          echo "ZIP extracted."
+          echo "ZIP extracted successfully."
 
       - name: Locate Flutter project
         id: project
@@ -128,9 +127,13 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Flutter version
+      - name: Show tool versions
         run: |
+          set -euo pipefail
+
           flutter --version
+          dart --version
+          java -version
 
       - name: Get dependencies
         env:
@@ -143,7 +146,7 @@ jobs:
 
           flutter pub get
 
-      - name: Automatic Dart fixes
+      - name: Apply safe Dart fixes
         env:
           PROJECT: ${{ steps.project.outputs.project }}
         shell: bash
@@ -152,48 +155,105 @@ jobs:
 
           cd "$PROJECT"
 
-          echo "Running dart fix..."
-
           dart fix --apply || true
+          dart format lib test integration_test || true
 
-          echo "Running dart format..."
-
-          dart format . || true
-
-      - name: Analyze project
+      - name: Configure Android compatibility
         env:
           PROJECT: ${{ steps.project.outputs.project }}
         shell: bash
         run: |
           set -euo pipefail
+
+          ANDROID="$PROJECT/android"
+
+          if test ! -d "$ANDROID"; then
+            echo "ERROR: Android directory not found:"
+            echo "$ANDROID"
+            exit 1
+          fi
+
+          GRADLE_PROPERTIES="$ANDROID/gradle.properties"
+          WRAPPER_PROPERTIES="$ANDROID/gradle/wrapper/gradle-wrapper.properties"
+
+          touch "$GRADLE_PROPERTIES"
+
+          echo "Configuring AGP 9 compatibility flags..."
+
+          if grep -q '^android.newDsl=' "$GRADLE_PROPERTIES"; then
+            sed -i 's/^android.newDsl=.*/android.newDsl=false/' "$GRADLE_PROPERTIES"
+          else
+            printf '\nandroid.newDsl=false\n' >> "$GRADLE_PROPERTIES"
+          fi
+
+          if grep -q '^android.builtInKotlin=' "$GRADLE_PROPERTIES"; then
+            sed -i 's/^android.builtInKotlin=.*/android.builtInKotlin=false/' "$GRADLE_PROPERTIES"
+          else
+            printf 'android.builtInKotlin=false\n' >> "$GRADLE_PROPERTIES"
+          fi
+
+          echo
+          echo "gradle.properties:"
+          cat "$GRADLE_PROPERTIES"
+
+          if test -f "$WRAPPER_PROPERTIES"; then
+
+            echo
+            echo "Current Gradle wrapper:"
+            grep '^distributionUrl=' "$WRAPPER_PROPERTIES" || true
+
+            sed -i \
+              -E 's#gradle-[0-9]+\.[0-9]+(\.[0-9]+)?-#gradle-8.14-#' \
+              "$WRAPPER_PROPERTIES"
+
+            echo
+            echo "Updated Gradle wrapper:"
+            grep '^distributionUrl=' "$WRAPPER_PROPERTIES" || true
+
+          else
+            echo "ERROR: Gradle wrapper properties not found:"
+            echo "$WRAPPER_PROPERTIES"
+            exit 1
+          fi
+
+      - name: Verify Gradle version
+        env:
+          PROJECT: ${{ steps.project.outputs.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT/android"
+
+          chmod +x ./gradlew
+
+          ./gradlew --version
+
+      - name: Run Flutter analyzer
+        env:
+          PROJECT: ${{ steps.project.outputs.project }}
+        shell: bash
+        run: |
+          set -u
 
           cd "$PROJECT"
 
           echo "Running Flutter analyzer..."
 
-          flutter analyze > ../analyze.log 2>&1 || true
+          flutter analyze \
+            > ../flutter-analyze.log 2>&1
 
-          cat ../analyze.log
+          STATUS=$?
 
-          echo
-          echo "Analyzer completed."
-          echo "Warnings and infos do not stop this workflow."
+          cat ../flutter-analyze.log
 
-      - name: Check Dart syntax
-        env:
-          PROJECT: ${{ steps.project.outputs.project }}
-        shell: bash
-        run: |
-          set -euo pipefail
+          if test "$STATUS" -ne 0; then
+            echo
+            echo "Analyzer found issues."
+            echo "Build will still be attempted so compiler errors can be identified."
+          fi
 
-          cd "$PROJECT"
-
-          echo "Checking Dart files..."
-
-          dart analyze lib test integration_test \
-            > ../dart-syntax.log 2>&1 || true
-
-          cat ../dart-syntax.log
+          exit 0
 
       - name: Build release APK
         env:
@@ -204,9 +264,12 @@ jobs:
 
           cd "$PROJECT"
 
+          flutter clean
+          flutter pub get
+
           flutter build apk --release
 
-      - name: Find generated APK
+      - name: Locate generated APK
         id: apk
         env:
           PROJECT: ${{ steps.project.outputs.project }}
@@ -226,12 +289,12 @@ jobs:
             exit 1
           fi
 
-          echo "APK:"
+          echo "Generated APK:"
           echo "$APK"
 
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
 
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: HOPE-release-apk
@@ -239,7 +302,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish APK to repository
+      - name: Publish APK
         env:
           APK: ${{ steps.apk.outputs.apk }}
         shell: bash
@@ -262,17 +325,14 @@ jobs:
             git push
           fi
 
-      - name: Build summary
+      - name: Final summary
         shell: bash
         run: |
           echo
           echo "========================================"
-          echo "HOPE BUILD COMPLETED"
+          echo "HOPE BOOTSTRAP FINISHED"
           echo "========================================"
           echo
-          echo "APK artifact:"
-          echo "HOPE-release-apk"
-          echo
-          echo "Repository APK:"
-          echo "releases/HOPE-release.apk"
+          echo "Artifact: HOPE-release-apk"
+          echo "Repository file: releases/HOPE-release.apk"
           echo
