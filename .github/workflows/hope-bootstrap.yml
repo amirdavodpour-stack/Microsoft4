@@ -12,10 +12,10 @@ on:
         description: "Build profile"
         required: true
         type: choice
-        default: production
+        default: pilot
         options:
-          - production
           - pilot
+          - production
 
 permissions:
   contents: write
@@ -31,20 +31,21 @@ jobs:
 
     env:
       CI_ZIP_BUILD: "true"
+      API_BASE_URL: ${{ secrets.API_BASE_URL != '' && secrets.API_BASE_URL || vars.API_BASE_URL }}
 
     steps:
 
-      # ------------------------------------------------------------
-      # 1. Checkout outer repository
-      # ------------------------------------------------------------
+      # ============================================================
+      # 1. Checkout
+      # ============================================================
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 2. Find ZIP
-      # ------------------------------------------------------------
+      # ============================================================
       - name: Find ZIP archive
         id: archive
         shell: bash
@@ -65,7 +66,7 @@ jobs:
             ARCHIVE="$(
               find . \
                 -type f \
-                \( -iname '*.zip' \) \
+                -iname '*.zip' \
                 ! -path './.git/*' \
                 ! -path './.hope-work/*' \
                 -print \
@@ -75,9 +76,6 @@ jobs:
 
             if [ -z "$ARCHIVE" ]; then
               echo "ERROR: No ZIP archive found in repository."
-              echo
-              echo "ZIP files found:"
-              find . -type f -iname '*.zip' ! -path './.git/*' -print || true
               exit 1
             fi
           fi
@@ -89,9 +87,9 @@ jobs:
 
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------
-      # 3. Prepare isolated source workspace
-      # ------------------------------------------------------------
+      # ============================================================
+      # 3. Prepare workspace
+      # ============================================================
       - name: Prepare workspace
         shell: bash
         run: |
@@ -100,9 +98,9 @@ jobs:
           rm -rf .hope-work
           mkdir -p .hope-work/source
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 4. Extract ZIP
-      # ------------------------------------------------------------
+      # ============================================================
       - name: Extract source ZIP
         shell: bash
         env:
@@ -114,9 +112,9 @@ jobs:
 
           echo "ZIP extraction completed."
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 5. Find Flutter project
-      # ------------------------------------------------------------
+      # ============================================================
       - name: Find Flutter project
         id: project
         shell: bash
@@ -134,6 +132,7 @@ jobs:
                 -type f \
                 -name 'pubspec.yaml' \
                 ! -path '*/.dart_tool/*' \
+                ! -path '*/build/*' \
                 -print \
               | sort \
               | head -n 1
@@ -146,8 +145,6 @@ jobs:
 
           if [ -z "$PROJECT" ]; then
             echo "ERROR: Could not find pubspec.yaml."
-            echo
-            echo "Extracted files:"
             find "$SOURCE" -maxdepth 4 -type f | sort | head -300
             exit 1
           fi
@@ -157,18 +154,18 @@ jobs:
 
           echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------
+      # ============================================================
       # 6. Setup Flutter
-      # ------------------------------------------------------------
+      # ============================================================
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      # ------------------------------------------------------------
-      # 7. Show versions
-      # ------------------------------------------------------------
+      # ============================================================
+      # 7. Tool versions
+      # ============================================================
       - name: Show tool versions
         shell: bash
         run: |
@@ -178,9 +175,9 @@ jobs:
           dart --version
           java -version
 
-      # ------------------------------------------------------------
-      # 8. Configure ZIP build mode
-      # ------------------------------------------------------------
+      # ============================================================
+      # 8. Configure environment
+      # ============================================================
       - name: Configure build environment
         shell: bash
         env:
@@ -205,9 +202,55 @@ jobs:
           echo "BUILD_PROFILE=$BUILD_PROFILE_INPUT"
           echo "CI_ZIP_BUILD=true"
 
-      # ------------------------------------------------------------
-      # 9. Dependencies
-      # ------------------------------------------------------------
+      # ============================================================
+      # 9. Validate API_BASE_URL
+      # ============================================================
+      - name: Validate API endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${API_BASE_URL:-}" ]; then
+            echo "ERROR: API_BASE_URL is not configured."
+            echo
+            echo "Configure one of these in:"
+            echo "Repository -> Settings -> Secrets and variables -> Actions"
+            echo
+            echo "Option A - Repository secret:"
+            echo "API_BASE_URL"
+            echo
+            echo "Option B - Repository variable:"
+            echo "API_BASE_URL"
+            echo
+            echo "Expected format:"
+            echo "https://YOUR-API-HOST/api/v1"
+            exit 1
+          fi
+
+          case "$API_BASE_URL" in
+            https://*)
+              ;;
+            *)
+              echo "ERROR: API_BASE_URL must use HTTPS."
+              exit 1
+              ;;
+          esac
+
+          if printf '%s' "$API_BASE_URL" | grep -Eq '[[:space:]]'; then
+            echo "ERROR: API_BASE_URL contains whitespace."
+            exit 1
+          fi
+
+          if ! printf '%s' "$API_BASE_URL" | grep -Eq '^https://[^[:space:]]+$'; then
+            echo "ERROR: API_BASE_URL is malformed."
+            exit 1
+          fi
+
+          echo "API_BASE_URL is configured and uses HTTPS."
+
+      # ============================================================
+      # 10. Flutter dependencies
+      # ============================================================
       - name: Flutter pub get
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
@@ -216,9 +259,9 @@ jobs:
 
           flutter pub get
 
-      # ------------------------------------------------------------
-      # 10. Repair generated localization if required
-      # ------------------------------------------------------------
+      # ============================================================
+      # 11. Localization
+      # ============================================================
       - name: Refresh generated localization
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
@@ -228,13 +271,15 @@ jobs:
           if [ -f "tools/generate_localization.sh" ]; then
             chmod +x tools/generate_localization.sh
             ./tools/generate_localization.sh
+          elif [ -f "l10n.yaml" ]; then
+            flutter gen-l10n
           else
             echo "Localization generator not present; continuing."
           fi
 
-      # ------------------------------------------------------------
-      # 11. Dart formatting
-      # ------------------------------------------------------------
+      # ============================================================
+      # 12. Format
+      # ============================================================
       - name: Format Dart source
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
@@ -243,10 +288,9 @@ jobs:
 
           dart format lib test integration_test || true
 
-      # ------------------------------------------------------------
-      # 12. Analyzer
-      #     Analyzer findings are reported but do not hide compiler errors.
-      # ------------------------------------------------------------
+      # ============================================================
+      # 13. Analyze
+      # ============================================================
       - name: Analyze Dart
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
@@ -260,14 +304,14 @@ jobs:
           if [ "$STATUS" -ne 0 ]; then
             echo
             echo "WARNING: Flutter analyzer reported issues."
-            echo "The Android compiler/build will still run."
+            echo "Build will continue so compiler/build errors can be identified."
           fi
 
           exit 0
 
-      # ------------------------------------------------------------
-      # 13. Configure Android Gradle compatibility
-      # ------------------------------------------------------------
+      # ============================================================
+      # 14. Gradle compatibility
+      # ============================================================
       - name: Configure Android Gradle
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
@@ -283,12 +327,11 @@ jobs:
 
           touch "$GRADLE_PROPERTIES"
 
-          # Flutter currently requires at least Gradle 8.14
+          # Keep the certified Gradle compatibility baseline.
           sed -i \
             -E 's#gradle-[0-9]+\.[0-9]+(\.[0-9]+)?-bin\.zip#gradle-8.14-bin.zip#' \
             "$WRAPPER_PROPERTIES"
 
-          # Official SHA-256 for Gradle 8.14 binary distribution.
           GRADLE_SHA256="61ad310d3c7d3e5da131b76bbf22b5a4c0786e9d892dae8c1658d4b484de3caa"
 
           if grep -q '^distributionSha256Sum=' "$WRAPPER_PROPERTIES"; then
@@ -301,14 +344,14 @@ jobs:
               >> "$WRAPPER_PROPERTIES"
           fi
 
-          # Keep the current project on the legacy Android DSL while
-          # AGP 9 migration is not part of this bootstrap build.
           if grep -q '^android.newDsl=' "$GRADLE_PROPERTIES"; then
             sed -i \
               's/^android.newDsl=.*/android.newDsl=false/' \
               "$GRADLE_PROPERTIES"
           else
-            printf '%s\n' 'android.newDsl=false' >> "$GRADLE_PROPERTIES"
+            printf '%s\n' \
+              'android.newDsl=false' \
+              >> "$GRADLE_PROPERTIES"
           fi
 
           if grep -q '^android.builtInKotlin=' "$GRADLE_PROPERTIES"; then
@@ -316,20 +359,21 @@ jobs:
               's/^android.builtInKotlin=.*/android.builtInKotlin=false/' \
               "$GRADLE_PROPERTIES"
           else
-            printf '%s\n' 'android.builtInKotlin=false' >> "$GRADLE_PROPERTIES"
+            printf '%s\n' \
+              'android.builtInKotlin=false' \
+              >> "$GRADLE_PROPERTIES"
           fi
 
-          echo
-          echo "===== Gradle wrapper ====="
+          echo "===== gradle-wrapper.properties ====="
           cat "$WRAPPER_PROPERTIES"
 
           echo
-          echo "===== Gradle properties ====="
+          echo "===== gradle.properties ====="
           cat "$GRADLE_PROPERTIES"
 
-      # ------------------------------------------------------------
-      # 14. Verify Gradle
-      # ------------------------------------------------------------
+      # ============================================================
+      # 15. Verify Gradle
+      # ============================================================
       - name: Verify Gradle wrapper
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
@@ -337,23 +381,11 @@ jobs:
           set -euo pipefail
 
           chmod +x android/gradlew
-
           ./android/gradlew --version
 
-      # ------------------------------------------------------------
-      # 15. Production signing setup
-      #
-      # IMPORTANT:
-      # The actual project expects:
-      #
-      # ANDROID_RELEASE_STORE_FILE
-      # ANDROID_RELEASE_STORE_PASSWORD
-      # ANDROID_RELEASE_KEY_ALIAS
-      # ANDROID_RELEASE_KEY_PASSWORD
-      #
-      # The repository's existing release workflow uses:
-      # ANDROID_RELEASE_KEYSTORE_B64
-      # ------------------------------------------------------------
+      # ============================================================
+      # 16. Production signing
+      # ============================================================
       - name: Configure production signing
         if: env.BUILD_PROFILE == 'production'
         shell: bash
@@ -365,8 +397,6 @@ jobs:
           if [ -z "${KEYSTORE_B64:-}" ]; then
             echo "ERROR: Missing GitHub repository secret:"
             echo "ANDROID_RELEASE_KEYSTORE_B64"
-            echo
-            echo "Production builds intentionally fail closed without a release keystore."
             exit 1
           fi
 
@@ -385,11 +415,11 @@ jobs:
 
           echo "ANDROID_RELEASE_STORE_FILE=$KEYSTORE_PATH" >> "$GITHUB_ENV"
 
-          echo "Production keystore prepared in runner temporary storage."
+          echo "Production keystore prepared."
 
-      # ------------------------------------------------------------
-      # 16. Verify production signing configuration
-      # ------------------------------------------------------------
+      # ============================================================
+      # 17. Verify production secrets
+      # ============================================================
       - name: Verify production signing secrets
         if: env.BUILD_PROFILE == 'production'
         shell: bash
@@ -418,20 +448,19 @@ jobs:
           test -n "${ANDROID_RELEASE_STORE_FILE:-}"
           test -f "$ANDROID_RELEASE_STORE_FILE"
 
-          echo "Release signing configuration is present."
+          echo "Production signing configuration is present."
 
-      # ------------------------------------------------------------
-      # 17. Build APK
-      #
-      # We intentionally use the project's own release helper when it
-      # exists because the repaired project already defines its release
-      # build contract there.
-      # ------------------------------------------------------------
+      # ============================================================
+      # 18. Build APK
+      # ============================================================
       - name: Build release APK
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         env:
+          API_BASE_URL: ${{ env.API_BASE_URL }}
           BUILD_PROFILE: ${{ env.BUILD_PROFILE }}
+
+          ANDROID_RELEASE_STORE_FILE: ${{ env.ANDROID_RELEASE_STORE_FILE }}
           ANDROID_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
           ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
           ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
@@ -441,6 +470,7 @@ jobs:
           echo "========================================"
           echo "HOPE Android Release Build"
           echo "BUILD_PROFILE=$BUILD_PROFILE"
+          echo "API_BASE_URL configured: yes"
           echo "========================================"
 
           flutter clean
@@ -450,12 +480,14 @@ jobs:
             chmod +x tools/build_apk_release.sh
             ./tools/build_apk_release.sh
           else
-            flutter build apk --release
+            flutter build apk \
+              --release \
+              --dart-define=API_BASE_URL="$API_BASE_URL"
           fi
 
-      # ------------------------------------------------------------
-      # 18. Locate APK
-      # ------------------------------------------------------------
+      # ============================================================
+      # 19. Locate APK
+      # ============================================================
       - name: Locate APK
         id: apk
         working-directory: ${{ env.PROJECT_DIR }}
@@ -480,9 +512,10 @@ jobs:
 
           if [ -z "$APK" ]; then
             echo "ERROR: APK was not generated."
-            echo
-            echo "Available Android output files:"
-            find build/app/outputs -type f -maxdepth 8 -print 2>/dev/null || true
+            find build/app/outputs \
+              -maxdepth 8 \
+              -type f \
+              -print 2>/dev/null || true
             exit 1
           fi
 
@@ -491,9 +524,9 @@ jobs:
           echo "APK=$APK"
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------
-      # 19. APK checksum
-      # ------------------------------------------------------------
+      # ============================================================
+      # 20. SHA256
+      # ============================================================
       - name: Generate APK checksum
         working-directory: ${{ env.PROJECT_DIR }}
         env:
@@ -506,9 +539,9 @@ jobs:
 
           cat "$APK.sha256"
 
-      # ------------------------------------------------------------
-      # 20. Verify APK signature
-      # ------------------------------------------------------------
+      # ============================================================
+      # 21. APK verification
+      # ============================================================
       - name: Verify APK signature
         working-directory: ${{ env.PROJECT_DIR }}
         env:
@@ -517,96 +550,29 @@ jobs:
         run: |
           set -euo pipefail
 
+          APKSIGNER=""
+
           if command -v apksigner >/dev/null 2>&1; then
-            apksigner verify --verbose "$APK"
-          else
-            echo "WARNING: apksigner unavailable on runner."
-            echo "Continuing because Flutter successfully generated the APK."
+            APKSIGNER="$(command -v apksigner)"
+          elif [ -n "${ANDROID_HOME:-}" ] &&
+               [ -f "${ANDROID_HOME}/build-tools/$(ls "${ANDROID_HOME}/build-tools" | sort -V | tail -n 1)/apksigner" ]; then
+            APKSIGNER="${ANDROID_HOME}/build-tools/$(ls "${ANDROID_HOME}/build-tools" | sort -V | tail -n 1)/apksigner"
           fi
 
-      # ------------------------------------------------------------
-      # 21. Upload final APK
-      # ------------------------------------------------------------
+          if [ -n "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --verbose "$APK"
+          else
+            echo "WARNING: apksigner unavailable."
+            echo "Flutter generated the APK successfully."
+          fi
+
+      # ============================================================
+      # 22. Upload artifact
+      # ============================================================
       - name: Upload HOPE APK
         uses: actions/upload-artifact@v4
         with:
           name: HOPE-${{ env.BUILD_PROFILE }}-${{ github.run_number }}
           path: |
             ${{ env.PROJECT_DIR }}/${{ steps.apk.outputs.apk }}
-            ${{ env.PROJECT_DIR }}/${{ steps.apk.outputs.apk }}.sha256
-          if-no-files-found: error
-          retention-days: 30
-
-      # ------------------------------------------------------------
-      # 22. Copy APK to repository releases/
-      # ------------------------------------------------------------
-      - name: Publish APK to repository
-        if: env.BUILD_PROFILE == 'production'
-        working-directory: ${{ env.PROJECT_DIR }}
-        env:
-          APK: ${{ steps.apk.outputs.apk }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$GITHUB_WORKSPACE/releases"
-
-          cp "$APK" \
-            "$GITHUB_WORKSPACE/releases/HOPE-release.apk"
-
-          cp "$APK.sha256" \
-            "$GITHUB_WORKSPACE/releases/HOPE-release.apk.sha256"
-
-      # ------------------------------------------------------------
-      # 23. Commit APK
-      # ------------------------------------------------------------
-      - name: Commit production APK
-        if: env.BUILD_PROFILE == 'production'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add releases/HOPE-release.apk
-          git add releases/HOPE-release.apk.sha256
-
-          if git diff --cached --quiet; then
-            echo "No repository changes to commit."
-          else
-            git commit -m "build: publish HOPE production APK"
-            git push
-          fi
-
-      # ------------------------------------------------------------
-      # 24. Cleanup signing material
-      # ------------------------------------------------------------
-      - name: Cleanup production keystore
-        if: ${{ always() && env.ANDROID_RELEASE_STORE_FILE != '' }}
-        shell: bash
-        env:
-          KEYSTORE_PATH: ${{ env.ANDROID_RELEASE_STORE_FILE }}
-        run: |
-          set -euo pipefail
-
-          if [ -n "${KEYSTORE_PATH:-}" ] &&
-             [ -f "$KEYSTORE_PATH" ]; then
-            rm -f -- "$KEYSTORE_PATH"
-            echo "Temporary release keystore removed."
-          fi
-
-      # ------------------------------------------------------------
-      # 25. Final summary
-      # ------------------------------------------------------------
-      - name: Build summary
-        if: always()
-        shell: bash
-        run: |
-          echo
-          echo "========================================"
-          echo "HOPE ZIP BOOTSTRAP"
-          echo "========================================"
-          echo "Profile : ${{ env.BUILD_PROFILE }}"
-          echo "Artifact: HOPE-${{ env.BUILD_PROFILE }}-${{ github.run_number }}"
-          echo "========================================"
+           
