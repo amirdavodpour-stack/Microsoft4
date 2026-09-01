@@ -8,6 +8,15 @@ on:
         required: false
         type: string
 
+      build_profile:
+        description: "HOPE build profile"
+        required: false
+        type: choice
+        default: production
+        options:
+          - production
+          - pilot
+
 permissions:
   contents: write
   actions: write
@@ -176,13 +185,10 @@ jobs:
 
           if test ! -f "$WRAPPER"; then
             echo "ERROR: Gradle wrapper properties not found."
-            echo "$WRAPPER"
             exit 1
           fi
 
           touch "$PROPERTIES"
-
-          echo "Configuring Android compatibility..."
 
           if grep -q '^android.newDsl=' "$PROPERTIES"; then
             sed -i 's/^android.newDsl=.*/android.newDsl=false/' "$PROPERTIES"
@@ -196,13 +202,9 @@ jobs:
             printf '%s\n' 'android.builtInKotlin=false' >> "$PROPERTIES"
           fi
 
-          echo "Updating Gradle wrapper to 8.14..."
-
           sed -i \
             -E 's#gradle-[0-9]+\.[0-9]+(\.[0-9]+)?-bin\.zip#gradle-8.14-bin.zip#' \
             "$WRAPPER"
-
-          echo "Updating official Gradle SHA-256..."
 
           if grep -q '^distributionSha256Sum=' "$WRAPPER"; then
             sed -i \
@@ -251,7 +253,7 @@ jobs:
           if test "$STATUS" -ne 0; then
             echo
             echo "WARNING: Analyzer reported issues."
-            echo "The build will continue so compiler/build errors can be identified."
+            echo "Build will continue."
           fi
 
           exit 0
@@ -259,14 +261,25 @@ jobs:
       - name: Build release APK
         env:
           PROJECT: ${{ steps.project.outputs.project }}
+          BUILD_PROFILE: ${{ inputs.build_profile }}
         shell: bash
         run: |
           set -euo pipefail
 
           cd "$PROJECT"
 
+          echo "BUILD_PROFILE=$BUILD_PROFILE"
+
+          if test "$BUILD_PROFILE" != "production" &&
+             test "$BUILD_PROFILE" != "pilot"; then
+            echo "ERROR: BUILD_PROFILE must be production or pilot."
+            exit 1
+          fi
+
           flutter clean
           flutter pub get
+
+          export BUILD_PROFILE="$BUILD_PROFILE"
 
           flutter build apk --release
 
@@ -333,6 +346,7 @@ jobs:
           echo "HOPE BUILD PIPELINE FINISHED"
           echo "========================================"
           echo
+          echo "Build profile: ${{ inputs.build_profile }}"
           echo "Artifact: HOPE-release-apk"
           echo "APK: releases/HOPE-release.apk"
           echo
