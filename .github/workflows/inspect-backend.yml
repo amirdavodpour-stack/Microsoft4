@@ -1,4 +1,4 @@
-name: Inspect HOPE Backend
+name: Inspect HOPE DB Schema
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract ZIP and inspect database files
+      - name: Extract ZIP and show database schema
         shell: bash
         run: |
           set -euo pipefail
@@ -24,53 +24,24 @@ jobs:
 
           ARCHIVE="$(find . -maxdepth 1 -type f -iname '*.zip' -print | sort | head -n 1)"
 
-          if [ -z "$ARCHIVE" ]; then
-            echo "ERROR: No ZIP archive found."
-            exit 1
-          fi
-
-          echo "Using archive: $ARCHIVE"
+          test -n "$ARCHIVE"
 
           unzip -q "$ARCHIVE" -d .inspect/source
 
-          DB_FILE="$(find .inspect/source -type f -path '*/backend/src/db.js' -print | head -n 1)"
-          MIGRATE_FILE="$(find .inspect/source -type f -path '*/backend/src/migrate.js' -print | head -n 1)"
           SCHEMA_FILE="$(find .inspect/source -type f -path '*/backend/src/db/schema.js' -print | head -n 1)"
 
-          if [ -z "$DB_FILE" ]; then
-            echo "ERROR: backend/src/db.js was not found."
-            exit 1
-          fi
+          test -n "$SCHEMA_FILE"
+
+          echo "================ notification_preferences ================"
+
+          grep -n -B 10 -A 30 "notification_preferences" "$SCHEMA_FILE" || true
 
           echo
-          echo "================ db.js ================"
-          nl -ba "$DB_FILE"
+          echo "================ all CREATE TABLE statements ================"
+
+          grep -n "CREATE TABLE" "$SCHEMA_FILE" || true
 
           echo
-          echo "================ migrate.js ================"
+          echo "================ schema.js first 220 lines ================"
 
-          if [ -n "$MIGRATE_FILE" ]; then
-            nl -ba "$MIGRATE_FILE"
-          else
-            echo "migrate.js not found"
-          fi
-
-          echo
-          echo "================ schema.js ================"
-
-          if [ -n "$SCHEMA_FILE" ]; then
-            nl -ba "$SCHEMA_FILE"
-          else
-            echo "schema.js not found"
-          fi
-
-          echo
-          echo "================ related database files ================"
-
-          find .inspect/source -type f \
-            \( \
-              -path '*/backend/src/db/*' \
-              -o -path '*/backend/src/*migration*' \
-              -o -path '*/backend/migrations/*' \
-            \) \
-            -print | sort
+          nl -ba "$SCHEMA_FILE" | head -n 220
