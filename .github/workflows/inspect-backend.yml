@@ -24,7 +24,10 @@ jobs:
 
           ARCHIVE="$(find . -maxdepth 1 -type f -iname '*.zip' -print | sort | head -n 1)"
 
-          test -n "$ARCHIVE"
+          if [ -z "$ARCHIVE" ]; then
+            echo "ERROR: No ZIP archive found."
+            exit 1
+          fi
 
           echo "Using archive: $ARCHIVE"
 
@@ -32,9 +35,14 @@ jobs:
 
           DB_FILE="$(find .inspect/source -type f -path '*/backend/src/db.js' -print | head -n 1)"
           MIGRATE_FILE="$(find .inspect/source -type f -path '*/backend/src/migrate.js' -print | head -n 1)"
+          SCHEMA_FILE="$(find .inspect/source -type f -path '*/backend/src/db/schema.js' -print | head -n 1)"
 
-          test -n "$DB_FILE"
+          if [ -z "$DB_FILE" ]; then
+            echo "ERROR: backend/src/db.js was not found."
+            exit 1
+          fi
 
+          echo
           echo "================ db.js ================"
           nl -ba "$DB_FILE"
 
@@ -48,8 +56,21 @@ jobs:
           fi
 
           echo
-          echo "================ related files ================"
+          echo "================ schema.js ================"
+
+          if [ -n "$SCHEMA_FILE" ]; then
+            nl -ba "$SCHEMA_FILE"
+          else
+            echo "schema.js not found"
+          fi
+
+          echo
+          echo "================ related database files ================"
 
           find .inspect/source -type f \
-            \( -path '*/backend/src/*' -o -path '*/backend/migrations/*' \) \
+            \( \
+              -path '*/backend/src/db/*' \
+              -o -path '*/backend/src/*migration*' \
+              -o -path '*/backend/migrations/*' \
+            \) \
             -print | sort
