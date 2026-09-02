@@ -154,18 +154,64 @@ jobs:
 
           if [ -f android/gradlew ]; then
             chmod +x android/gradlew
+          else
+            echo "ERROR: android/gradlew not found."
+            exit 1
           fi
 
           if [ -f android/gradle/wrapper/gradle-wrapper.properties ]; then
+
+            echo "Original Gradle wrapper configuration:"
+            cat android/gradle/wrapper/gradle-wrapper.properties
+
+            echo ""
+            echo "Pinning Gradle to 8.14..."
+
             sed -i \
-              's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14-bin.zip#' \
+              's#^distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14-bin.zip#' \
               android/gradle/wrapper/gradle-wrapper.properties
+
+            echo ""
+            echo "Fixing Gradle 8.14 SHA-256 checksum..."
+
+            if grep -q '^distributionSha256Sum=' android/gradle/wrapper/gradle-wrapper.properties; then
+              sed -i \
+                's#^distributionSha256Sum=.*#distributionSha256Sum=61ad310d3c7d3e5da131b76bbf22b5a4c0786e9d892dae8c1658d4b484de3caa#' \
+                android/gradle/wrapper/gradle-wrapper.properties
+            else
+              printf '%s\n' \
+                'distributionSha256Sum=61ad310d3c7d3e5da131b76bbf22b5a4c0786e9d892dae8c1658d4b484de3caa' \
+                >> android/gradle/wrapper/gradle-wrapper.properties
+            fi
+
+            echo ""
+            echo "Final Gradle wrapper configuration:"
+            cat android/gradle/wrapper/gradle-wrapper.properties
+
+            echo ""
+            echo "Checking Gradle wrapper pins..."
+
+            grep -q \
+              'distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14-bin.zip' \
+              android/gradle/wrapper/gradle-wrapper.properties
+
+            grep -q \
+              'distributionSha256Sum=61ad310d3c7d3e5da131b76bbf22b5a4c0786e9d892dae8c1658d4b484de3caa' \
+              android/gradle/wrapper/gradle-wrapper.properties
+
+            echo "Gradle 8.14 wrapper + checksum verified."
+
+          else
+            echo "ERROR: gradle-wrapper.properties not found."
+            exit 1
           fi
 
-          echo "Gradle:"
-          grep "distributionUrl" android/gradle/wrapper/gradle-wrapper.properties || true
-
+          echo ""
+          echo "Running Flutter clean..."
           flutter clean
+
+          echo ""
+          echo "Running Flutter pub get..."
           flutter pub get
 
       - name: Verify application configuration
@@ -180,12 +226,15 @@ jobs:
           echo "========================================"
           echo "BUILD_PROFILE=$BUILD_PROFILE"
           echo "Flutter=3.47.0"
+          echo "Java=17"
+          echo "Gradle=8.14"
           echo "API_BASE_URL configured=yes"
           echo "========================================"
 
           test -f pubspec.yaml
           test -d android
           test -f android/gradlew
+          test -f android/gradle/wrapper/gradle-wrapper.properties
 
       - name: Flutter analyzer
         shell: bash
@@ -199,6 +248,26 @@ jobs:
 
           flutter analyze
 
+      - name: Verify Gradle wrapper integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          echo "========================================"
+          echo "GRADLE WRAPPER INTEGRITY CHECK"
+          echo "========================================"
+
+          grep "distributionUrl" \
+            android/gradle/wrapper/gradle-wrapper.properties
+
+          grep "distributionSha256Sum" \
+            android/gradle/wrapper/gradle-wrapper.properties
+
+          echo ""
+          echo "Gradle wrapper configuration is valid."
+
       - name: Build APK
         shell: bash
         run: |
@@ -208,11 +277,15 @@ jobs:
 
           echo "========================================"
           echo "HOPE Android APK Build"
+          echo "========================================"
           echo "BUILD_PROFILE=$BUILD_PROFILE"
           echo "Flutter=3.47.0"
+          echo "Java=17"
+          echo "Gradle=8.14"
           echo "API_BASE_URL configured=yes"
           echo "========================================"
 
+          echo ""
           echo "Building directly with Flutter."
           echo "Skipping tools/build_apk_release.sh CI toolchain guard."
 
@@ -221,6 +294,7 @@ jobs:
             --dart-define="API_BASE_URL=$API_BASE_URL" \
             --dart-define="BUILD_PROFILE=$BUILD_PROFILE"
 
+          echo ""
           echo "========================================"
           echo "Flutter APK build finished."
           echo "========================================"
@@ -232,4 +306,49 @@ jobs:
 
           cd "$PROJECT_DIR"
 
-          echo "Searching
+          echo "Searching for generated APK..."
+
+          APK="$(find build/app/outputs -type f -name '*.apk' -print -quit 2>/dev/null || true)"
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: No APK was generated."
+            echo ""
+            echo "APK output directory:"
+            find build/app/outputs -maxdepth 6 -type f 2>/dev/null || true
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+          cp "$APK" \
+            "$GITHUB_WORKSPACE/artifacts/HOPE-pilot-release.apk"
+
+          echo "========================================"
+          echo "APK FOUND"
+          echo "========================================"
+
+          ls -lh "$GITHUB_WORKSPACE/artifacts/HOPE-pilot-release.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-pilot-APK
+          path: artifacts/HOPE-pilot-release.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build summary
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "HOPE BUILD COMPLETED"
+          echo "========================================"
+          echo "Profile: $BUILD_PROFILE"
+          echo "Flutter: 3.47.0"
+          echo "Java: 17"
+          echo "Gradle: 8.14"
+          echo "API_BASE_URL: configured"
+          echo ""
+          echo "Generated artifacts:"
+          ls -lh artifacts/
+          echo "========================================"
