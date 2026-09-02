@@ -17,32 +17,44 @@ env:
 
 jobs:
   audit:
+    name: HOPE Complete Audit
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@v6
 
-      - name: Prepare audit workspace
+      - name: Create audit workspace
         shell: bash
         run: |
           set +e
 
           mkdir -p audit-results
-          echo "HOPE Full Audit" > audit-results/SUMMARY.txt
-          echo "Repository: $GITHUB_REPOSITORY" >> audit-results/SUMMARY.txt
-          echo "Commit: $GITHUB_SHA" >> audit-results/SUMMARY.txt
-          echo "Started: $(date -u)" >> audit-results/SUMMARY.txt
+          mkdir -p source
 
-          echo "Searching for HOPE source ZIP..."
+          {
+            echo "HOPE Marketplace Full Audit"
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Commit: $GITHUB_SHA"
+            echo "Run ID: $GITHUB_RUN_ID"
+            echo "Started UTC: $(date -u)"
+          } > audit-results/SUMMARY.txt
+
+      - name: Locate HOPE source ZIP
+        shell: bash
+        run: |
+          set +e
 
           ZIP=""
-          for f in \
-            "HOPE-MARKETPLACE-3.8.0-V6-REPAIRED.zip" \
-            "HOPE-3_8_0-build-ready.zip" \
+
+          CANDIDATES=(
+            "HOPE-MARKETPLACE-3.8.0-V6-REPAIRED.zip"
+            "HOPE-3_8_0-build-ready.zip"
             "HOPE-marketplace-test-apk-ready-v5-1.zip"
-          do
+          )
+
+          for f in "${CANDIDATES[@]}"; do
             if [ -f "$f" ]; then
               ZIP="$f"
               break
@@ -50,17 +62,18 @@ jobs:
           done
 
           if [ -z "$ZIP" ]; then
-            ZIP="$(find . -maxdepth 2 -type f -iname '*.zip' | head -n 1)"
+            ZIP="$(find . -maxdepth 3 -type f -iname '*.zip' | head -n 1)"
           fi
 
           if [ -z "$ZIP" ]; then
-            echo "BLOCKED: No HOPE source ZIP found." | tee audit-results/ZIP-STATUS.txt
+            echo "BLOCKED" > audit-results/source.status
+            echo "No HOPE source ZIP found." > audit-results/source.log
             exit 0
           fi
 
-          echo "SOURCE_ZIP=$ZIP" | tee audit-results/ZIP-STATUS.txt
+          echo "PASS" > audit-results/source.status
+          echo "SOURCE_ZIP=$ZIP" | tee audit-results/source.log
 
-          mkdir -p source
           unzip -q "$ZIP" -d source
 
           ROOT="$(find source -type f -name pubspec.yaml -print -quit | xargs -r dirname)"
@@ -70,61 +83,68 @@ jobs:
           fi
 
           if [ -z "$ROOT" ]; then
-            echo "BLOCKED: Flutter project root not found." | tee audit-results/ROOT-STATUS.txt
+            echo "BLOCKED" > audit-results/root.status
+            echo "Flutter project root was not found." > audit-results/root.log
             exit 0
           fi
 
           ROOT="$(cd "$ROOT" && pwd)"
+
           echo "$ROOT" > audit-results/PROJECT_ROOT.txt
 
-          echo "PROJECT_ROOT=$ROOT"
-          echo "PROJECT_ROOT=$ROOT" >> audit-results/SUMMARY.txt
+          {
+            echo
+            echo "PROJECT_ROOT=$ROOT"
+          } >> audit-results/SUMMARY.txt
 
-      - name: Setup Java
-        uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
 
-      - name: Setup Flutter
-        uses: subosito/flutter-action@fd55a3d2a1e42b5f3e8c9c4a6d7f4b6a2e4f8c1d
+      - name: Setup Flutter 3.47.1
+        uses: subosito/flutter-action@v2
         with:
-          flutter-version: 3.47.1
+          flutter-version: "3.47.1"
           channel: stable
           cache: true
 
-      - name: Flutter environment
+      - name: Capture toolchain
         shell: bash
         run: |
           set +e
 
-          flutter --version > audit-results/flutter-version.txt 2>&1
-          flutter doctor -v > audit-results/flutter-doctor.txt 2>&1
+          flutter --version > audit-results/flutter-version.log 2>&1
+          flutter doctor -v > audit-results/flutter-doctor.log 2>&1
+          java -version > audit-results/java-version.log 2>&1
+          node --version > audit-results/node-version.log 2>&1
+          npm --version > audit-results/npm-version.log 2>&1
 
-          cat audit-results/flutter-version.txt
-          cat audit-results/flutter-doctor.txt
-
-      - name: Flutter dependency and static audit
+      - name: Flutter dependency audit
         shell: bash
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt)"
+          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
 
-          if [ ! -d "$ROOT" ]; then
-            echo "BLOCKED" > audit-results/flutter-static.status
+          if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
+            echo "BLOCKED" > audit-results/flutter-dependencies.status
             exit 0
           fi
 
           cd "$ROOT"
 
           {
-            echo "=== PUBSPEC LOCK ==="
+            echo "========================================"
+            echo "PUBSPEC LOCK"
+            echo "========================================"
+
             if [ -f pubspec.lock ]; then
               echo "PASS: pubspec.lock exists"
             else
@@ -132,133 +152,185 @@ jobs:
             fi
 
             echo
-            echo "=== PUB GET ==="
+            echo "========================================"
+            echo "PUB GET"
+            echo "========================================"
+
             flutter pub get
 
             echo
-            echo "=== GEN L10N ==="
+            echo "========================================"
+            echo "GEN L10N"
+            echo "========================================"
+
             flutter gen-l10n
+          } > "$GITHUB_WORKSPACE/audit-results/flutter-dependencies.log" 2>&1
 
-            echo
-            echo "=== DART FORMAT ==="
-            dart format --set-exit-if-changed .
+          RC=$?
 
-            echo
-            echo "=== FLUTTER ANALYZE ==="
-            flutter analyze
-
-            echo
-            echo "=== FLUTTER TEST ==="
-            flutter test --no-pub
-          } > "$GITHUB_WORKSPACE/audit-results/flutter-static.log" 2>&1
-
-          STATUS=$?
-
-          if [ "$STATUS" -eq 0 ]; then
-            echo "PASS" > "$GITHUB_WORKSPACE/audit-results/flutter-static.status"
+          if [ "$RC" -eq 0 ]; then
+            echo "PASS" > "$GITHUB_WORKSPACE/audit-results/flutter-dependencies.status"
           else
-            echo "FAIL" > "$GITHUB_WORKSPACE/audit-results/flutter-static.status"
+            echo "FAIL" > "$GITHUB_WORKSPACE/audit-results/flutter-dependencies.status"
           fi
 
           exit 0
 
-      - name: Project scripts audit
+      - name: Flutter format and analyze
         shell: bash
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt)"
+          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
 
-          {
-            echo "=== PROJECT FILES ==="
-            find "$ROOT" -maxdepth 3 -type f | sort | head -n 500
+          if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
+            echo "BLOCKED" > audit-results/flutter-analyze.status
+            exit 0
+          fi
 
-            echo
-            echo "=== PACKAGE JSON DISCOVERY ==="
-            find "$ROOT" -name package.json -print
-
-            echo
-            echo "=== NPM SCRIPTS ==="
-
-            for PKG in $(find "$ROOT" -name package.json -print); do
-              echo "--- $PKG ---"
-              node -e "const p=require('./$PKG'); console.log(JSON.stringify(p.scripts||{},null,2))" 2>&1
-            done
-          } > audit-results/project-scripts.log 2>&1
-
-          echo "PASS" > audit-results/project-scripts.status
-
-      - name: Backend tests
-        shell: bash
-        run: |
-          set +e
-
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt)"
           cd "$ROOT"
 
-          FOUND=0
-          FAILED=0
+          {
+            echo "========================================"
+            echo "DART FORMAT"
+            echo "========================================"
+
+            dart format --set-exit-if-changed .
+
+            FORMAT_RC=$?
+
+            echo
+            echo "FORMAT_EXIT_CODE=$FORMAT_RC"
+
+            echo
+            echo "========================================"
+            echo "FLUTTER ANALYZE"
+            echo "========================================"
+
+            flutter analyze
+
+            ANALYZE_RC=$?
+
+            echo
+            echo "ANALYZE_EXIT_CODE=$ANALYZE_RC"
+          } > "$GITHUB_WORKSPACE/audit-results/flutter-analyze.log" 2>&1
+
+          if [ "$FORMAT_RC" -eq 0 ] && [ "$ANALYZE_RC" -eq 0 ]; then
+            echo "PASS" > "$GITHUB_WORKSPACE/audit-results/flutter-analyze.status"
+          else
+            echo "FAIL" > "$GITHUB_WORKSPACE/audit-results/flutter-analyze.status"
+          fi
+
+          exit 0
+
+      - name: Flutter unit and widget tests
+        shell: bash
+        run: |
+          set +e
+
+          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
+
+          if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
+            echo "BLOCKED" > audit-results/flutter-tests.status
+            exit 0
+          fi
+
+          cd "$ROOT"
+
+          flutter test --no-pub \
+            > "$GITHUB_WORKSPACE/audit-results/flutter-tests.log" 2>&1
+
+          RC=$?
+
+          echo "EXIT_CODE=$RC" \
+            >> "$GITHUB_WORKSPACE/audit-results/flutter-tests.log"
+
+          if [ "$RC" -eq 0 ]; then
+            echo "PASS" > "$GITHUB_WORKSPACE/audit-results/flutter-tests.status"
+          else
+            echo "FAIL" > "$GITHUB_WORKSPACE/audit-results/flutter-tests.status"
+          fi
+
+          exit 0
+
+      - name: Backend audit
+        shell: bash
+        run: |
+          set +e
+
+          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
+
+          if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
+            echo "BLOCKED" > audit-results/backend.status
+            exit 0
+          fi
+
+          cd "$ROOT"
+
+          FAILURES=0
+          CASES=0
 
           run_case() {
             NAME="$1"
             shift
 
-            FOUND=$((FOUND+1))
+            CASES=$((CASES + 1))
 
             echo
-            echo "=================================================="
+            echo "========================================"
             echo "CASE: $NAME"
             echo "COMMAND: $*"
-            echo "=================================================="
+            echo "========================================"
 
             "$@"
             RC=$?
 
-            echo
-            echo "RESULT: $NAME exit=$RC"
+            echo "RESULT: $NAME -> exit $RC"
 
             if [ "$RC" -ne 0 ]; then
-              FAILED=$((FAILED+1))
+              FAILURES=$((FAILURES + 1))
             fi
 
             return 0
           }
 
-          if [ -f package.json ]; then
+          {
+            if [ -f package.json ]; then
 
-            run_case "npm-ci" npm ci --ignore-scripts
+              run_case "npm-ci" npm ci --ignore-scripts
 
-            if npm run | grep -q "check"; then
-              run_case "npm-check" npm run check
+              if npm run 2>/dev/null | grep -qE '(^|[[:space:]])check($|[[:space:]])'; then
+                run_case "npm-check" npm run check
+              fi
+
+              if npm run 2>/dev/null | grep -qE '(^|[[:space:]])test($|[[:space:]])'; then
+                run_case "npm-test" npm test
+              fi
+
+              if npm run 2>/dev/null | grep -q 'test:contract'; then
+                run_case "npm-test-contract" npm run test:contract
+              fi
+
+              if npm run 2>/dev/null | grep -q 'test:product'; then
+                run_case "npm-test-product" npm run test:product
+              fi
+
+              if npm run 2>/dev/null | grep -q 'check:all'; then
+                run_case "npm-check-all" npm run check:all
+              fi
+
+              run_case "npm-audit" npm audit --audit-level=high
+
+            else
+              echo "No package.json found."
             fi
 
-            if npm run | grep -q "test"; then
-              run_case "npm-test" npm test
-            fi
+            echo
+            echo "TOTAL_CASES=$CASES"
+            echo "TOTAL_FAILURES=$FAILURES"
+          } > "$GITHUB_WORKSPACE/audit-results/backend.log" 2>&1
 
-            if npm run | grep -q "test:contract"; then
-              run_case "npm-test-contract" npm run test:contract
-            fi
-
-            if npm run | grep -q "test:product"; then
-              run_case "npm-test-product" npm run test:product
-            fi
-
-            if npm run | grep -q "check:all"; then
-              run_case "npm-check-all" npm run check:all
-            fi
-
-            run_case "npm-audit" npm audit --audit-level=high
-
-          else
-            echo "No package.json found."
-          fi
-
-          echo
-          echo "BACKEND_CASES=$FOUND"
-          echo "BACKEND_FAILURES=$FAILED"
-
-          if [ "$FAILED" -eq 0 ]; then
+          if [ "$FAILURES" -eq 0 ]; then
             echo "PASS" > "$GITHUB_WORKSPACE/audit-results/backend.status"
           else
             echo "FAIL" > "$GITHUB_WORKSPACE/audit-results/backend.status"
@@ -266,29 +338,63 @@ jobs:
 
           exit 0
 
+      - name: Localization and UX checks
+        shell: bash
+        run: |
+          set +e
+
+          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
+
+          {
+            echo "========================================"
+            echo "LOCALIZATION / UX DISCOVERY"
+            echo "========================================"
+
+            find "$ROOT" \
+              -type f \
+              \( -name '*.dart' -o -name '*.yaml' -o -name '*.json' \) \
+              | sort | head -n 2000
+
+            echo
+            echo "========================================"
+            echo "LOCALIZATION REFERENCES"
+            echo "========================================"
+
+            grep -RInE \
+              'gen-l10n|localization|locale|supportedLocales|arb' \
+              "$ROOT" 2>/dev/null | head -n 500
+
+          } > audit-results/localization-ux.log 2>&1
+
+          echo "PASS" > audit-results/localization-ux.status
+
       - name: Android configuration audit
         shell: bash
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt)"
+          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
 
           {
-            echo "=== ANDROID CONFIGURATION ==="
+            echo "========================================"
+            echo "ANDROID CONFIGURATION"
+            echo "========================================"
 
-            if [ -f "$ROOT/android/app/build.gradle" ]; then
-              cat "$ROOT/android/app/build.gradle"
-            elif [ -f "$ROOT/android/app/build.gradle.kts" ]; then
-              cat "$ROOT/android/app/build.gradle.kts"
-            else
-              echo "Android app Gradle file not found."
-            fi
+            find "$ROOT/android" \
+              -maxdepth 4 \
+              -type f \
+              \( -name '*.gradle' -o -name '*.gradle.kts' -o -name 'gradle.properties' -o -name 'AndroidManifest.xml' \) \
+              -print 2>/dev/null
 
             echo
-            echo "=== GRADLE FILES ==="
-            find "$ROOT/android" -maxdepth 3 -type f \
-              \( -name '*.gradle' -o -name '*.gradle.kts' -o -name 'gradle.properties' \) \
-              -print 2>/dev/null
+            echo "========================================"
+            echo "ANDROID VALUES"
+            echo "========================================"
+
+            grep -RInE \
+              'compileSdk|targetSdk|minSdk|namespace|applicationId|ndkVersion|sourceCompatibility|targetCompatibility|jvmTarget' \
+              "$ROOT/android" 2>/dev/null | head -n 500
+
           } > audit-results/android-config.log 2>&1
 
           echo "PASS" > audit-results/android-config.status
@@ -298,14 +404,17 @@ jobs:
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt)"
+          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
+
+          if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
+            echo "BLOCKED" > audit-results/android-build.status
+            exit 0
+          fi
+
           cd "$ROOT"
 
-          echo "=== FLUTTER BUILD APK RELEASE ===" \
-            > "$GITHUB_WORKSPACE/audit-results/android-build.log"
-
           flutter build apk --release \
-            >> "$GITHUB_WORKSPACE/audit-results/android-build.log" 2>&1
+            > "$GITHUB_WORKSPACE/audit-results/android-build.log" 2>&1
 
           RC=$?
 
@@ -313,15 +422,29 @@ jobs:
             >> "$GITHUB_WORKSPACE/audit-results/android-build.log"
 
           if [ "$RC" -eq 0 ]; then
+
             echo "PASS" > "$GITHUB_WORKSPACE/audit-results/android-build.status"
 
             {
-              echo "=== APK FILES ==="
-              find "$ROOT/build" -type f -name '*.apk' -exec ls -lh {} \; 2>/dev/null
+              echo "========================================"
+              echo "APK FILES"
+              echo "========================================"
+
+              find "$ROOT/build" \
+                -type f \
+                -name '*.apk' \
+                -exec ls -lh {} \; 2>/dev/null
 
               echo
-              echo "=== SHA256 ==="
-              find "$ROOT/build" -type f -name '*.apk' -exec sha256sum {} \; 2>/dev/null
+              echo "========================================"
+              echo "APK SHA256"
+              echo "========================================"
+
+              find "$ROOT/build" \
+                -type f \
+                -name '*.apk' \
+                -exec sha256sum {} \; 2>/dev/null
+
             } > "$GITHUB_WORKSPACE/audit-results/apk-evidence.txt"
 
           else
@@ -330,64 +453,131 @@ jobs:
 
           exit 0
 
-      - name: Security and secret scan
+      - name: Workflow consistency audit
         shell: bash
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt)"
+          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
 
           {
-            echo "=== POSSIBLE SECRET PATTERNS ==="
+            echo "========================================"
+            echo "WORKFLOW FILES"
+            echo "========================================"
+
+            find "$ROOT/.github/workflows" \
+              -type f \
+              -maxdepth 2 \
+              -print 2>/dev/null
+
+            echo
+            echo "========================================"
+            echo "FLUTTER REFERENCES"
+            echo "========================================"
+
+            grep -RInE \
+              'flutter-version|FLUTTER_VERSION' \
+              "$ROOT/.github/workflows" 2>/dev/null
+
+            echo
+            echo "========================================"
+            echo "JAVA REFERENCES"
+            echo "========================================"
+
+            grep -RInE \
+              'java-version|JAVA_VERSION' \
+              "$ROOT/.github/workflows" 2>/dev/null
+
+            echo
+            echo "========================================"
+            echo "ACTION REFERENCES"
+            echo "========================================"
+
+            grep -RIn 'uses:' \
+              "$ROOT/.github/workflows" 2>/dev/null
+
+          } > audit-results/workflow-consistency.log 2>&1
+
+          echo "PASS" > audit-results/workflow-consistency.status
+
+      - name: Security scan
+        shell: bash
+        run: |
+          set +e
+
+          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
+
+          {
+            echo "========================================"
+            echo "POSSIBLE SECRET / CREDENTIAL REFERENCES"
+            echo "========================================"
 
             grep -RInE \
               --exclude-dir=.git \
               --exclude='*.lock' \
               --exclude='*.sum' \
               '(api[_-]?key|secret[_-]?key|private[_-]?key|password|BEGIN RSA PRIVATE KEY|BEGIN OPENSSH PRIVATE KEY)' \
-              "$ROOT" 2>/dev/null | head -n 200
+              "$ROOT" 2>/dev/null | head -n 500
 
             echo
-            echo "=== GITIGNORE ==="
+            echo "========================================"
+            echo "GITIGNORE"
+            echo "========================================"
 
             if [ -f "$ROOT/.gitignore" ]; then
               cat "$ROOT/.gitignore"
             fi
-          } > audit-results/security-scan.log 2>&1
 
-          echo "REVIEW_REQUIRED" > audit-results/security-scan.status
+          } > audit-results/security.log 2>&1
 
-      - name: Workflow consistency audit
+          echo "REVIEW_REQUIRED" > audit-results/security.status
+
+      - name: Runtime environment detection
         shell: bash
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt)"
+          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
 
           {
-            echo "=== WORKFLOWS ==="
-            find "$ROOT/.github/workflows" -type f -maxdepth 2 \
+            echo "========================================"
+            echo "DOCKER"
+            echo "========================================"
+
+            if command -v docker >/dev/null 2>&1; then
+              docker --version
+              echo "Docker available"
+            else
+              echo "Docker unavailable"
+            fi
+
+            echo
+            echo "========================================"
+            echo "EMULATORS / DEVICES"
+            echo "========================================"
+
+            if command -v adb >/dev/null 2>&1; then
+              adb devices
+            else
+              echo "ADB unavailable"
+            fi
+
+            echo
+            echo "========================================"
+            echo "RUNTIME FILES"
+            echo "========================================"
+
+            find "$ROOT" \
+              -maxdepth 4 \
+              -type f \
+              \( -name 'docker-compose*.yml' -o -name 'compose*.yml' -o -name 'Dockerfile*' \) \
               -print 2>/dev/null
 
-            echo
-            echo "=== FLUTTER VERSIONS ==="
-            grep -RIn "flutter-version\|FLUTTER_VERSION" \
-              "$ROOT/.github/workflows" 2>/dev/null
+          } > audit-results/runtime-environment.log 2>&1
 
-            echo
-            echo "=== JAVA VERSIONS ==="
-            grep -RIn "java-version\|JAVA_VERSION" \
-              "$ROOT/.github/workflows" 2>/dev/null
+          echo "PASS" > audit-results/runtime-environment.status
 
-            echo
-            echo "=== ACTION REFERENCES ==="
-            grep -RIn "uses:" \
-              "$ROOT/.github/workflows" 2>/dev/null
-          } > audit-results/workflow-audit.log 2>&1
-
-          echo "PASS" > audit-results/workflow-audit.status
-
-      - name: Generate final audit report
+      - name: Generate final report
         if: always()
         shell: bash
         run: |
@@ -396,60 +586,85 @@ jobs:
           REPORT="audit-results/FINAL-AUDIT-REPORT.md"
 
           {
-            echo "# HOPE Marketplace — Full Audit Report"
+            echo "# HOPE Marketplace — Full Audit"
             echo
-            echo "## Execution"
+            echo "## Run Information"
             echo
             echo "- Repository: $GITHUB_REPOSITORY"
             echo "- Commit: $GITHUB_SHA"
-            echo "- Run: $GITHUB_RUN_ID"
-            echo "- Date UTC: $(date -u)"
-            echo "- Flutter target: $FLUTTER_VERSION"
-            echo "- Java target: $JAVA_VERSION"
+            echo "- Run ID: $GITHUB_RUN_ID"
+            echo "- Workflow: $GITHUB_WORKFLOW"
+            echo "- Flutter: $FLUTTER_VERSION"
+            echo "- Java: $JAVA_VERSION"
+            echo "- Node: $NODE_VERSION"
+            echo "- UTC: $(date -u)"
             echo
             echo "## Result Matrix"
             echo
             echo "| Area | Result |"
             echo "|---|---|"
 
-            for f in \
-              flutter-static \
-              project-scripts \
+            for area in \
+              source \
+              root \
+              flutter-dependencies \
+              flutter-analyze \
+              flutter-tests \
               backend \
+              localization-ux \
               android-config \
               android-build \
-              security-scan \
-              workflow-audit
+              workflow-consistency \
+              security \
+              runtime-environment
             do
-              if [ -f "audit-results/$f.status" ]; then
-                RESULT="$(cat "audit-results/$f.status")"
+              if [ -f "audit-results/$area.status" ]; then
+                RESULT="$(cat "audit-results/$area.status")"
               else
-                RESULT="NOT RUN"
+                RESULT="NOT_RUN"
               fi
 
-              echo "| $f | $RESULT |"
+              echo "| $area | $RESULT |"
             done
 
             echo
-            echo "## Source ZIP"
+            echo "## Source"
             echo
-            cat audit-results/ZIP-STATUS.txt 2>/dev/null || true
+
+            if [ -f audit-results/source.log ]; then
+              cat audit-results/source.log
+            fi
 
             echo
-            echo "## Important Evidence"
+            echo "## Project Root"
             echo
-            echo "All detailed logs are included in the workflow artifact."
+
+            if [ -f audit-results/PROJECT_ROOT.txt ]; then
+              cat audit-results/PROJECT_ROOT.txt
+            else
+              echo "Not detected"
+            fi
+
             echo
-            echo "## Interpretation"
+            echo "## Important Interpretation"
             echo
-            echo "- PASS means the case completed successfully."
-            echo "- FAIL means the case executed and found an error."
-            echo "- BLOCKED means required source/tooling/runtime was unavailable."
-            echo "- REVIEW_REQUIRED means manual/security review is required."
+            echo "PASS = executed successfully."
             echo
-            echo "## Files"
+            echo "FAIL = executed and reported an error."
             echo
-            find audit-results -maxdepth 1 -type f -printf '%f\n' | sort
+            echo "BLOCKED = required source/tooling/runtime was unavailable."
+            echo
+            echo "REVIEW_REQUIRED = requires manual review."
+            echo
+            echo "## Evidence Files"
+            echo
+
+            find audit-results \
+              -maxdepth 1 \
+              -type f \
+              -printf '%f\n' \
+              | sort
+
           } > "$REPORT"
 
           cp "$REPORT" audit-results/FINAL-AUDIT-REPORT.txt
@@ -459,17 +674,19 @@ jobs:
             echo "  \"repository\": \"$GITHUB_REPOSITORY\","
             echo "  \"commit\": \"$GITHUB_SHA\","
             echo "  \"run_id\": \"$GITHUB_RUN_ID\","
+            echo "  \"workflow\": \"$GITHUB_WORKFLOW\","
             echo "  \"flutter\": \"$FLUTTER_VERSION\","
             echo "  \"java\": \"$JAVA_VERSION\","
-            echo "  \"date_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+            echo "  \"node\": \"$NODE_VERSION\","
+            echo "  \"generated_utc\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
             echo "}"
           } > audit-results/FINAL-AUDIT-REPORT.json
 
           cat "$REPORT"
 
-      - name: Upload complete audit evidence
+      - name: Upload complete evidence
         if: always()
-        uses: actions/upload-artifact@6027e3dd177782cd8ab9af838c04fd81a07f1d47
+        uses: actions/upload-artifact@v4
         with:
           name: HOPE-FULL-AUDIT-${{ github.run_number }}
           path: audit-results
@@ -484,13 +701,17 @@ jobs:
 
           FAIL=0
 
-          for f in \
-            flutter-static \
-            backend \
-            android-build
-          do
-            if [ -f "audit-results/$f.status" ]; then
-              RESULT="$(cat "audit-results/$f.status")"
+          REQUIRED_CASES=(
+            "flutter-dependencies"
+            "flutter-analyze"
+            "flutter-tests"
+            "backend"
+            "android-build"
+          )
+
+          for area in "${REQUIRED_CASES[@]}"; do
+            if [ -f "audit-results/$area.status" ]; then
+              RESULT="$(cat "audit-results/$area.status")"
 
               if [ "$RESULT" = "FAIL" ]; then
                 FAIL=1
@@ -498,12 +719,13 @@ jobs:
             fi
           done
 
-          echo "=========================================="
+          echo
+          echo "========================================"
           echo "HOPE FULL AUDIT FINAL GATE"
-          echo "=========================================="
+          echo "========================================"
 
           if [ "$FAIL" -eq 0 ]; then
-            echo "No mandatory executed case reported FAIL."
+            echo "No executed mandatory case reported FAIL."
             exit 0
           fi
 
