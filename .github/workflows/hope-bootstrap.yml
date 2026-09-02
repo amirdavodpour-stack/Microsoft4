@@ -73,7 +73,6 @@ jobs:
         with:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
-          cache: gradle
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -130,8 +129,7 @@ jobs:
           flutter pub get
           flutter gen-l10n || true
 
-          # IMPORTANT:
-          # Regenerates Flutter Android configuration and
+          # Regenerate Flutter Android configuration and
           # GeneratedPluginRegistrant for integration_test.
           flutter build --config-only
 
@@ -165,9 +163,7 @@ jobs:
 
           cd "$PROJECT_ROOT"
 
-          if [[ ! -x android/gradlew ]]; then
-            chmod +x android/gradlew
-          fi
+          chmod +x android/gradlew
 
           ./android/gradlew --version || true
 
@@ -194,9 +190,9 @@ jobs:
           flutter pub get
           flutter gen-l10n || true
 
-          # REQUIRED WORKAROUND:
-          # Flutter can generate GeneratedPluginRegistrant.java with
-          # integration_test while using --no-pub.
+          # CRITICAL FIX:
+          # Regenerate Flutter Android configuration before
+          # the final --no-pub APK build.
           flutter build --config-only
 
           test -f android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
@@ -250,9 +246,9 @@ jobs:
             flutter pub get
             flutter gen-l10n || true
 
-            # CRITICAL FIX:
-            # Regenerate Flutter Android configuration BEFORE
-            # running the final --no-pub APK build.
+            # CRITICAL:
+            # Regenerate GeneratedPluginRegistrant after every
+            # isolated copy and before --no-pub.
             flutter build --config-only
 
             if [[ ! -f android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java ]]; then
@@ -261,6 +257,7 @@ jobs:
             fi
 
             echo "Checking generated plugin registrant..."
+
             if grep -n "integration_test" \
               android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java; then
               echo "integration_test registration detected."
@@ -279,7 +276,10 @@ jobs:
             set -e
 
             if [[ "$BUILD_EXIT" -eq 0 ]]; then
-              APK_PATH="$(find build/app/outputs/apk -type f -name '*.apk' -print -quit)"
+              APK_PATH="$(find build/app/outputs/apk \
+                -type f \
+                -name '*.apk' \
+                -print -quit)"
 
               if [[ -n "${APK_PATH:-}" && -f "$APK_PATH" ]]; then
                 APK_SIZE="$(stat -c%s "$APK_PATH")"
@@ -302,7 +302,7 @@ jobs:
 
             echo "Attempt $ATTEMPT failed."
 
-            echo "Recent Flutter build diagnostics:"
+            echo "Recent diagnostics:"
             find . -type f \
               \( -name '*.log' -o -name 'GeneratedPluginRegistrant.java' \) \
               | head -50 || true
