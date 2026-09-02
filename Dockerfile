@@ -13,7 +13,8 @@ RUN set -eux; \
     BACKEND_DIR="$(dirname "$BACKEND_PACKAGE")"; \
     cp -a "$BACKEND_DIR"/. /app/; \
     test -f /app/package.json; \
-    test -f /app/src/server.js
+    test -f /app/src/server.js; \
+    test -f /app/src/migrate.js
 
 WORKDIR /app
 RUN npm ci --omit=dev && npm cache clean --force
@@ -33,4 +34,4 @@ USER hope
 
 EXPOSE 3000
 
-CMD ["node", "src/server.js"]
+CMD ["sh", "-c", "node src/migrate.js && node src/server.js"]
