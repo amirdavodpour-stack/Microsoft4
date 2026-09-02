@@ -16,14 +16,33 @@ RUN set -eux; \
     test -f /app/package.json; \
     test -f /app/src/server.js; \
     test -f /app/src/db/schema.js; \
-    echo "Patching notification_preferences schema..."; \
-    sed -i 's/marketing BOOLEAN NOT NULL DEFAULT FALSE, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()/marketing BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()/' /app/src/db/schema.js; \
-    echo "Injecting live PostgreSQL migration..."; \
-    sed -i '/marketing BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()/a\
-    ALTER TABLE notification_preferences ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();' /app/src/db/schema.js; \
-    echo "Verifying patch..."; \
-    grep -n -A8 -B3 "notification_preferences" /app/src/db/schema.js; \
-    echo "Patch completed."
+    echo "Creating database migration..."; \
+    cat > /app/src/preflight-migration.js <<'EOF'
+import { getPool } from './db.js';
+
+const pool = getPool();
+
+if (!pool) {
+  console.log('DATABASE_URL not configured; skipping PostgreSQL migration.');
+  process.exit(0);
+}
+
+const client = await pool.connect();
+
+try {
+  console.log('Running HOPE PostgreSQL preflight migration...');
+
+  await client.query(`
+    ALTER TABLE notification_preferences
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+
+  console.log('notification_preferences.created_at is ready.');
+} finally {
+  client.release();
+  await pool.end();
+}
+EOF
 
 WORKDIR /app
 
@@ -45,4 +64,4 @@ USER hope
 
 EXPOSE 3000
 
-CMD ["node", "src/server.js"]
+CMD ["sh", "-c", "node src/preflight-migration.js && node src/server.js"]
