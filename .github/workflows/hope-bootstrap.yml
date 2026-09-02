@@ -9,7 +9,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: hope-zip-bootstrap-${{ github.ref }}
@@ -84,6 +84,8 @@ jobs:
       - name: Show toolchain
         shell: bash
         run: |
+          set -e
+
           flutter --version
           dart --version
           java -version
@@ -97,41 +99,64 @@ jobs:
           rm -rf .hope-project
           mkdir -p .hope-project
 
-          unzip -q "${{ steps.locate_zip.outputs.source }}" -d .hope-project
+          unzip -q \
+            "${{ steps.locate_zip.outputs.source }}" \
+            -d .hope-project
 
           if [[ -f ".hope-project/pubspec.yaml" ]]; then
             PROJECT_ROOT=".hope-project"
           else
-            PROJECT_ROOT="$(find .hope-project -maxdepth 3 -name pubspec.yaml -print -quit \
-              | xargs -r dirname)"
+            PROJECT_ROOT="$(
+              find .hope-project \
+                -maxdepth 4 \
+                -name pubspec.yaml \
+                -print -quit \
+                | xargs -r dirname
+            )"
           fi
 
           if [[ -z "${PROJECT_ROOT:-}" || ! -f "$PROJECT_ROOT/pubspec.yaml" ]]; then
             echo "Flutter project not found after extraction."
-            find .hope-project -maxdepth 3 -type f | head -100
+            find .hope-project -maxdepth 4 -type f | head -200
             exit 1
           fi
 
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
-          echo "Project root: $PROJECT_ROOT"
+
+          echo "========================================"
+          echo "PROJECT ROOT"
+          echo "$PROJECT_ROOT"
+          echo "========================================"
 
       - name: Validate Flutter project
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f "$PROJECT_ROOT/pubspec.yaml"
-          test -d "$PROJECT_ROOT/android"
-          test -f "$PROJECT_ROOT/android/gradlew"
-
           cd "$PROJECT_ROOT"
 
+          test -f pubspec.yaml
+          test -d android
+          test -f android/gradlew
+
+          chmod +x android/gradlew
+
+          echo "Flutter project detected successfully."
+
           flutter pub get
+
+          echo "Generating localization..."
           flutter gen-l10n || true
 
-          # Regenerate Flutter Android configuration and
-          # GeneratedPluginRegistrant for integration_test.
-          flutter build --config-only
+          echo "Checking generated Android files..."
+
+          find android/app/src \
+            -type f \
+            \( \
+              -name 'GeneratedPluginRegistrant.java' \
+              -o -name 'GeneratedPluginRegistrant.kt' \
+            \) \
+            -print || true
 
       - name: Validate API configuration
         shell: bash
@@ -156,27 +181,23 @@ jobs:
 
           echo "API_BASE_URL configured successfully."
 
-      - name: Align Gradle wrapper
+      - name: Stop Gradle daemons
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
 
           cd "$PROJECT_ROOT"
 
           chmod +x android/gradlew
 
-          ./android/gradlew --version || true
+          ./android/gradlew --stop || true
 
-      - name: Preflight cleanup and configuration
+      - name: Preflight cleanup
         shell: bash
-        env:
-          API_BASE_URL: ${{ secrets.API_BASE_URL || vars.API_BASE_URL }}
         run: |
           set -euo pipefail
 
           cd "$PROJECT_ROOT"
-
-          ./android/gradlew --stop || true
 
           rm -rf \
             build \
@@ -187,21 +208,23 @@ jobs:
             android/app/build
 
           flutter clean
+
           flutter pub get
+
+          echo "Generating localization..."
           flutter gen-l10n || true
 
-          # CRITICAL FIX:
-          # Regenerate Flutter Android configuration before
-          # the final --no-pub APK build.
-          flutter build --config-only
+          echo "Checking Flutter plugin registration..."
 
-          test -f android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
+          find android/app/src \
+            -type f \
+            \( \
+              -name 'GeneratedPluginRegistrant.java' \
+              -o -name 'GeneratedPluginRegistrant.kt' \
+            \) \
+            -print || true
 
-          echo "GeneratedPluginRegistrant.java:"
-          sed -n '1,120p' \
-            android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
-
-      - name: Build APK with self-healing attempts
+      - name: Build APK with isolated self-healing attempts
         shell: bash
         env:
           API_BASE_URL: ${{ secrets.API_BASE_URL || vars.API_BASE_URL }}
@@ -212,6 +235,8 @@ jobs:
           SUCCESS=0
 
           for ATTEMPT in 1 2 3; do
+
+            echo
             echo "============================================================"
             echo "BUILD ATTEMPT $ATTEMPT / 3"
             echo "============================================================"
@@ -219,19 +244,31 @@ jobs:
             ATTEMPT_DIR="$GITHUB_WORKSPACE/.hope-attempt-$ATTEMPT"
             GRADLE_HOME="$GITHUB_WORKSPACE/.gradle-attempt-$ATTEMPT"
 
-            rm -rf "$ATTEMPT_DIR" "$GRADLE_HOME"
+            rm -rf "$ATTEMPT_DIR"
+            rm -rf "$GRADLE_HOME"
 
             cp -a "$BASE_PROJECT" "$ATTEMPT_DIR"
+
             mkdir -p "$GRADLE_HOME"
 
             chmod +x "$ATTEMPT_DIR/android/gradlew"
 
             export GRADLE_USER_HOME="$GRADLE_HOME"
-            export GRADLE_OPTS="-Dorg.gradle.daemon=false -Dorg.gradle.vfs.watch=false -Dorg.gradle.parallel=false -Dorg.gradle.caching=false -Dorg.gradle.configuration-cache=false"
+
+            export GRADLE_OPTS="\
+            -Dorg.gradle.daemon=false \
+            -Dorg.gradle.vfs.watch=false \
+            -Dorg.gradle.parallel=false \
+            -Dorg.gradle.caching=false \
+            -Dorg.gradle.configuration-cache=false"
 
             cd "$ATTEMPT_DIR"
 
+            echo "Stopping Gradle..."
+
             ./android/gradlew --stop || true
+
+            echo "Cleaning attempt..."
 
             rm -rf \
               build \
@@ -243,25 +280,39 @@ jobs:
 
             flutter clean
 
+            echo "Running flutter pub get..."
+
             flutter pub get
+
+            echo "Generating localization..."
+
             flutter gen-l10n || true
 
-            # CRITICAL:
-            # Regenerate GeneratedPluginRegistrant after every
-            # isolated copy and before --no-pub.
-            flutter build --config-only
+            echo
+            echo "============================================================"
+            echo "PLUGIN REGISTRANT"
+            echo "============================================================"
 
-            if [[ ! -f android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java ]]; then
-              echo "GeneratedPluginRegistrant.java was not generated."
-              exit 1
+            REGISTRANT="android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java"
+
+            if [[ -f "$REGISTRANT" ]]; then
+              echo "GeneratedPluginRegistrant.java exists."
+
+              if grep -n "integration_test" "$REGISTRANT"; then
+                echo
+                echo "integration_test registration detected."
+              else
+                echo
+                echo "integration_test registration NOT detected."
+              fi
+            else
+              echo "GeneratedPluginRegistrant.java not found."
             fi
 
-            echo "Checking generated plugin registrant..."
-
-            if grep -n "integration_test" \
-              android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java; then
-              echo "integration_test registration detected."
-            fi
+            echo
+            echo "============================================================"
+            echo "BUILDING APK"
+            echo "============================================================"
 
             set +e
 
@@ -275,24 +326,37 @@ jobs:
 
             set -e
 
+            echo "Flutter build exit code: $BUILD_EXIT"
+
             if [[ "$BUILD_EXIT" -eq 0 ]]; then
-              APK_PATH="$(find build/app/outputs/apk \
-                -type f \
-                -name '*.apk' \
-                -print -quit)"
+
+              APK_PATH="$(
+                find build/app/outputs/apk \
+                  -type f \
+                  -name '*.apk' \
+                  -print -quit
+              )"
 
               if [[ -n "${APK_PATH:-}" && -f "$APK_PATH" ]]; then
+
                 APK_SIZE="$(stat -c%s "$APK_PATH")"
 
+                echo
+                echo "APK FOUND:"
+                echo "$APK_PATH"
+                echo "SIZE: $APK_SIZE bytes"
+
                 if [[ "$APK_SIZE" -gt 1000000 ]]; then
-                  echo "APK successfully built:"
-                  echo "$APK_PATH"
-                  echo "APK size: $APK_SIZE bytes"
 
                   mkdir -p "$GITHUB_WORKSPACE/artifacts"
 
                   cp "$APK_PATH" \
                     "$GITHUB_WORKSPACE/artifacts/HOPE-3.8.0+11-pilot.apk"
+
+                  echo
+                  echo "============================================================"
+                  echo "APK BUILD SUCCESSFUL"
+                  echo "============================================================"
 
                   SUCCESS=1
                   break
@@ -300,18 +364,64 @@ jobs:
               fi
             fi
 
-            echo "Attempt $ATTEMPT failed."
+            echo
+            echo "============================================================"
+            echo "ATTEMPT $ATTEMPT FAILED"
+            echo "============================================================"
 
-            echo "Recent diagnostics:"
-            find . -type f \
-              \( -name '*.log' -o -name 'GeneratedPluginRegistrant.java' \) \
-              | head -50 || true
+            echo
+            echo "GeneratedPluginRegistrant diagnostic:"
+
+            if [[ -f "$REGISTRANT" ]]; then
+              grep -n \
+                -E "integration_test|IntegrationTestPlugin" \
+                "$REGISTRANT" || true
+            fi
+
+            echo
+            echo "Relevant generated files:"
+
+            find . \
+              -type f \
+              \( \
+                -name 'GeneratedPluginRegistrant.java' \
+                -o -name '*.log' \
+              \) \
+              | head -100 || true
 
             cd "$GITHUB_WORKSPACE"
+
           done
 
           if [[ "$SUCCESS" -ne 1 ]]; then
-            echo "All APK build attempts failed."
+            echo
+            echo "============================================================"
+            echo "ALL APK BUILD ATTEMPTS FAILED"
+            echo "============================================================"
+
+            exit 1
+          fi
+
+      - name: Verify final APK
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="artifacts/HOPE-3.8.0+11-pilot.apk"
+
+          test -f "$APK"
+
+          SIZE="$(stat -c%s "$APK")"
+
+          echo "Final APK:"
+          echo "$APK"
+
+          echo "Final APK size:"
+          echo "$SIZE bytes"
+
+          if [[ "$SIZE" -le 1000000 ]]; then
+            echo "APK is suspiciously small."
             exit 1
           fi
 
@@ -323,28 +433,59 @@ jobs:
 
           mkdir -p diagnostics
 
-          echo "=== Repository ===" > diagnostics/diagnostics.txt
-          git rev-parse HEAD >> diagnostics/diagnostics.txt
+          echo "=== Repository ===" \
+            > diagnostics/diagnostics.txt
 
-          echo "=== Flutter ===" >> diagnostics/diagnostics.txt
-          flutter --version >> diagnostics/diagnostics.txt 2>&1
+          git rev-parse HEAD \
+            >> diagnostics/diagnostics.txt 2>&1
 
-          echo "=== Project ===" >> diagnostics/diagnostics.txt
-          echo "PROJECT_ROOT=$PROJECT_ROOT" >> diagnostics/diagnostics.txt
+          echo "" \
+            >> diagnostics/diagnostics.txt
 
-          find .hope-project -maxdepth 3 -type f \
+          echo "=== Flutter ===" \
+            >> diagnostics/diagnostics.txt
+
+          flutter --version \
+            >> diagnostics/diagnostics.txt 2>&1
+
+          echo "" \
+            >> diagnostics/diagnostics.txt
+
+          echo "=== Project ===" \
+            >> diagnostics/diagnostics.txt
+
+          echo "PROJECT_ROOT=$PROJECT_ROOT" \
+            >> diagnostics/diagnostics.txt
+
+          echo "" \
+            >> diagnostics/diagnostics.txt
+
+          echo "=== Project Files ===" \
+            >> diagnostics/diagnostics.txt
+
+          find .hope-project \
+            -maxdepth 4 \
+            -type f \
             | sort \
-            | head -200 \
-            > diagnostics/project-files.txt
+            | head -300 \
+            >> diagnostics/diagnostics.txt 2>&1
 
           for ATTEMPT in 1 2 3; do
+
             if [[ -d ".hope-attempt-$ATTEMPT" ]]; then
-              find ".hope-attempt-$ATTEMPT" -type f \
-                \( -name '*.log' -o -name 'GeneratedPluginRegistrant.java' \) \
+
+              find ".hope-attempt-$ATTEMPT" \
+                -type f \
+                \( \
+                  -name '*.log' \
+                  -o -name 'GeneratedPluginRegistrant.java' \
+                \) \
                 | sort \
                 | head -100 \
                 > "diagnostics/attempt-$ATTEMPT-files.txt"
+
             fi
+
           done
 
       - name: Upload APK artifact
