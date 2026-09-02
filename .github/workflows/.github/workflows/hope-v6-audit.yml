@@ -1,0 +1,402 @@
+name: HOPE V6 Full Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_zip:
+        description: "Source ZIP filename in repository root"
+        required: true
+        type: string
+        default: "v6.zip"
+
+      run_tests:
+        description: "Run Flutter tests"
+        required: false
+        type: boolean
+        default: true
+
+      run_android_build:
+        description: "Build Android release APK"
+        required: false
+        type: boolean
+        default: true
+
+      run_security:
+        description: "Run dependency/security checks"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: hope-v6-audit-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: "3.47.1"
+  JAVA_VERSION: "17"
+  ANDROID_API: "36"
+  NDK_VERSION: "28.2.13676358"
+  SOURCE_ZIP: ${{ inputs.source_zip }}
+
+jobs:
+
+  validate_source:
+    name: Validate V6 Source
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify source ZIP exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Repository root:"
+          ls -lah
+
+          test -f "${SOURCE_ZIP}" || {
+            echo "::error::Source ZIP '${SOURCE_ZIP}' was not found in repository root."
+            exit 1
+          }
+
+          echo "Found:"
+          ls -lh "${SOURCE_ZIP}"
+
+      - name: Validate ZIP integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          unzip -t "${SOURCE_ZIP}"
+
+      - name: Inspect ZIP structure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p /tmp/hope-source
+          unzip -q "${SOURCE_ZIP}" -d /tmp/hope-source
+
+          echo "Extracted source:"
+          find /tmp/hope-source -maxdepth 3 -type f | sort | head -300
+
+          find /tmp/hope-source -type f -name pubspec.yaml | head -20
+          find /tmp/hope-source -type f -name gradlew | head -20
+
+  flutter_audit:
+    name: Flutter Analyze and Test
+    needs: validate_source
+    if: ${{ inputs.run_tests }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify source ZIP
+        run: test -f "${SOURCE_ZIP}"
+
+      - name: Extract V6 source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "${GITHUB_WORKSPACE}/hope"
+          mkdir -p "${GITHUB_WORKSPACE}/hope"
+
+          unzip -q "${SOURCE_ZIP}" -d "${GITHUB_WORKSPACE}/hope"
+
+          echo "Extracted tree:"
+          find "${GITHUB_WORKSPACE}/hope" -maxdepth 3 -type f | sort | head -300
+
+      - name: Detect Flutter project root
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PUBSPEC="$(find "${GITHUB_WORKSPACE}/hope" -type f -name pubspec.yaml -print -quit)"
+
+          test -n "${PUBSPEC}" || {
+            echo "::error::pubspec.yaml was not found in extracted V6 source."
+            exit 1
+          }
+
+          PROJECT_ROOT="$(dirname "${PUBSPEC}")"
+
+          echo "PROJECT_ROOT=${PROJECT_ROOT}" >> "${GITHUB_ENV}"
+
+          echo "Flutter project:"
+          echo "${PROJECT_ROOT}"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Flutter doctor
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: flutter doctor -v
+
+      - name: Pub get
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: flutter analyze
+
+      - name: Format check
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dart format --output=none --set-exit-if-changed lib test
+
+      - name: Run tests
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: flutter test --reporter expanded
+
+  security_audit:
+    name: Security and Dependency Audit
+    needs: validate_source
+    if: ${{ inputs.run_security }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "${GITHUB_WORKSPACE}/hope"
+          mkdir -p "${GITHUB_WORKSPACE}/hope"
+
+          unzip -q "${SOURCE_ZIP}" -d "${GITHUB_WORKSPACE}/hope"
+
+      - name: Locate project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PUBSPEC="$(find "${GITHUB_WORKSPACE}/hope" -type f -name pubspec.yaml -print -quit)"
+          test -n "${PUBSPEC}"
+
+          echo "PROJECT_ROOT=$(dirname "${PUBSPEC}")" >> "${GITHUB_ENV}"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Pub get
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: flutter pub get
+
+      - name: Dependency audit
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          flutter pub outdated || true
+
+          if command -v trivy >/dev/null 2>&1; then
+            trivy fs .
+          else
+            echo "Trivy not installed; continuing with Flutter dependency inspection."
+          fi
+
+      - name: Secret pattern scan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Scanning source for obvious secret-like patterns..."
+
+          if grep -RInE \
+            --exclude-dir=.git \
+            --exclude='*.lock' \
+            --exclude='*.png' \
+            --exclude='*.jpg' \
+            --exclude='*.jpeg' \
+            --exclude='*.webp' \
+            '(api[_-]?key|secret[_-]?key|private[_-]?key|password[[:space:]]*[:=]|access[_-]?token)' \
+            "${GITHUB_WORKSPACE}/hope"; then
+
+            echo "::warning::Potential secret-like patterns found. Review manually."
+          else
+            echo "No obvious secret-like patterns found."
+          fi
+
+  android_release:
+    name: Android Release Build
+    needs: validate_source
+    if: ${{ inputs.run_android_build }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "${GITHUB_WORKSPACE}/hope"
+          mkdir -p "${GITHUB_WORKSPACE}/hope"
+
+          unzip -q "${SOURCE_ZIP}" -d "${GITHUB_WORKSPACE}/hope"
+
+      - name: Locate Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PUBSPEC="$(find "${GITHUB_WORKSPACE}/hope" -type f -name pubspec.yaml -print -quit)"
+          test -n "${PUBSPEC}"
+
+          echo "PROJECT_ROOT=$(dirname "${PUBSPEC}")" >> "${GITHUB_ENV}"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Flutter pub get
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: flutter pub get
+
+      - name: Android toolchain information
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          java -version
+          flutter doctor -v
+
+          echo "Android configuration:"
+          find android -maxdepth 3 -type f | sort | head -200
+
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          flutter build apk --release
+
+      - name: Locate APK
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$(find build/app/outputs/apk/release -type f -name '*.apk' -print -quit)"
+
+          if [ -z "${APK}" ]; then
+            echo "::error::Release APK was not produced."
+            find build -type f | sort | head -300 || true
+            exit 1
+          fi
+
+          echo "APK=${APK}" >> "${GITHUB_ENV}"
+
+          ls -lh "${APK}"
+
+      - name: APK SHA256
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sha256sum "${APK}" | tee apk-sha256.txt
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: hope-v6-release-apk
+          path: |
+            ${{ env.PROJECT_ROOT }}/${{ env.APK }}
+            ${{ env.PROJECT_ROOT }}/apk-sha256.txt
+          if-no-files-found: error
+
+  aggregate:
+    name: Final V6 Gate
+    needs:
+      - validate_source
+      - flutter_audit
+      - security_audit
+      - android_release
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Evaluate audit jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "validate_source=${{ needs.validate_source.result }}"
+          echo "flutter_audit=${{ needs.flutter_audit.result }}"
+          echo "security_audit=${{ needs.security_audit.result }}"
+          echo "android_release=${{ needs.android_release.result }}"
+
+          if [ "${{ needs.validate_source.result }}" != "success" ]; then
+            echo "::error::Source validation failed."
+            exit 1
+          fi
+
+          if [ "${{ needs.flutter_audit.result }}" != "success" ] && \
+             [ "${{ inputs.run_tests }}" = "true" ]; then
+            echo "::error::Flutter audit failed."
+            exit 1
+          fi
+
+          if [ "${{ needs.security_audit.result }}" != "success" ] && \
+             [ "${{ inputs.run_security }}" = "true" ]; then
+            echo "::error::Security audit failed."
+            exit 1
+          fi
+
+          if [ "${{ needs.android_release.result }}" != "success" ] && \
+             [ "${{ inputs.run_android_build }}" = "true" ]; then
+            echo "::error::Android release build failed."
+            exit 1
+          fi
+
+          echo "======================================"
+          echo "HOPE V6 FINAL AUDIT GATE: PASSED"
+          echo "======================================"
