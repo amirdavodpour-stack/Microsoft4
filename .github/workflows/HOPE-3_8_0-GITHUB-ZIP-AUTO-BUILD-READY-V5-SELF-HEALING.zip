@@ -1,0 +1,686 @@
+name: HOPE Diagnostic Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      archive:
+        description: "ZIP filename in repository"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hope-diagnostic-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_ZIP: HOPE-3_8_0-GITHUB-ZIP-AUTO-BUILD-READY-V5-SELF-HEALING.zip
+  FLUTTER_VERSION: "3.47.0"
+  JAVA_VERSION: "17"
+
+jobs:
+  diagnostic:
+    name: HOPE Full Build Diagnostic
+    runs-on: ubuntu-22.04
+
+    steps:
+
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      # ============================================================
+      # LOCATE ZIP
+      # ============================================================
+
+      - name: Locate ZIP
+        id: locate_zip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVE="${{ inputs.archive }}"
+
+          if [[ -n "$ARCHIVE" ]]; then
+            test -f "$ARCHIVE"
+            SOURCE="$ARCHIVE"
+
+          elif [[ -f "$SOURCE_ZIP" ]]; then
+            SOURCE="$SOURCE_ZIP"
+
+          else
+            SOURCE="$(
+              find . \
+                -maxdepth 3 \
+                -type f \
+                \( \
+                  -name 'HOPE-*.zip' \
+                  -o \
+                  -name '*.zip' \
+                \) \
+                | sort \
+                | head -n 1
+            )"
+          fi
+
+          if [[ -z "${SOURCE:-}" ]]; then
+            echo "No ZIP found."
+            exit 1
+          fi
+
+          echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
+
+          echo "Using:"
+          echo "$SOURCE"
+
+      # ============================================================
+      # ZIP VALIDATION
+      # ============================================================
+
+      - name: Verify ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          unzip -t \
+            "${{ steps.locate_zip.outputs.source }}"
+
+      # ============================================================
+      # JAVA
+      # ============================================================
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # ============================================================
+      # FLUTTER
+      # ============================================================
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      # ============================================================
+      # TOOLCHAIN INFO
+      # ============================================================
+
+      - name: Toolchain diagnostics
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p diagnostics
+
+          {
+            echo "===== FLUTTER ====="
+            flutter --version
+
+            echo
+            echo "===== DART ====="
+            dart --version
+
+            echo
+            echo "===== JAVA ====="
+            java -version
+
+            echo
+            echo "===== FLUTTER DOCTOR ====="
+            flutter doctor -v
+
+            echo
+            echo "===== ANDROID SDK ====="
+            echo "ANDROID_HOME=$ANDROID_HOME"
+            echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+
+            echo
+            echo "===== DISK ====="
+            df -h
+
+            echo
+            echo "===== MEMORY ====="
+            free -h
+
+            echo
+            echo "===== CPU ====="
+            nproc
+          } 2>&1 | tee diagnostics/toolchain.txt
+
+      # ============================================================
+      # EXTRACT
+      # ============================================================
+
+      - name: Extract project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf .hope-project
+
+          mkdir -p .hope-project
+
+          unzip -q \
+            "${{ steps.locate_zip.outputs.source }}" \
+            -d .hope-project
+
+          if [[ -f ".hope-project/pubspec.yaml" ]]; then
+            PROJECT_ROOT=".hope-project"
+          else
+            PROJECT_ROOT="$(
+              find .hope-project \
+                -maxdepth 4 \
+                -name pubspec.yaml \
+                -print \
+                -quit \
+                | xargs -r dirname
+            )"
+          fi
+
+          if [[ -z "${PROJECT_ROOT:-}" ]]; then
+            echo "Could not locate Flutter project."
+            exit 1
+          fi
+
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+
+          echo "PROJECT_ROOT=$PROJECT_ROOT"
+
+      # ============================================================
+      # PROJECT BASIC VALIDATION
+      # ============================================================
+
+      - name: Basic project validation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_ROOT"
+
+          test -f pubspec.yaml
+          test -f pubspec.lock
+          test -d android
+          test -f android/gradlew
+          test -f android/settings.gradle.kts
+          test -f android/build.gradle.kts
+          test -f android/app/build.gradle.kts
+
+          chmod +x android/gradlew
+
+          echo
+          echo "===== PUBSPEC ====="
+          cat pubspec.yaml
+
+          echo
+          echo "===== FLUTTER VERSION FILE ====="
+          cat .flutter-version || true
+
+          echo
+          echo "===== TOOLCHAIN ====="
+          cat toolchain.yaml || true
+
+          echo
+          echo "===== GRADLE WRAPPER ====="
+          cat android/gradle/wrapper/gradle-wrapper.properties
+
+          echo
+          echo "===== SETTINGS ====="
+          cat android/settings.gradle.kts
+
+          echo
+          echo "===== APP GRADLE ====="
+          cat android/app/build.gradle.kts
+
+      # ============================================================
+      # DEPENDENCIES
+      # ============================================================
+
+      - name: Flutter pub get
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_ROOT"
+
+          flutter pub get
+
+          echo
+          echo "===== PUB DEPS ====="
+
+          flutter pub deps \
+            --style=compact \
+            | tee "$GITHUB_WORKSPACE/diagnostics/pub-deps.txt"
+
+      # ============================================================
+      # GENERATED FILES
+      # ============================================================
+
+      - name: Generate localization and plugin files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_ROOT"
+
+          flutter gen-l10n || true
+
+          echo
+          echo "===== GENERATED PLUGIN REGISTRANT ====="
+
+          REGISTRANT="android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java"
+
+          if [[ -f "$REGISTRANT" ]]; then
+            cat "$REGISTRANT" \
+              | tee \
+                "$GITHUB_WORKSPACE/diagnostics/GeneratedPluginRegistrant.java"
+          else
+            echo "GeneratedPluginRegistrant.java not found."
+          fi
+
+          echo
+          echo "===== INTEGRATION TEST REFERENCES ====="
+
+          grep -Rni \
+            -E \
+            "integration_test|IntegrationTestPlugin" \
+            android \
+            .flutter-plugins \
+            .flutter-plugins-dependencies \
+            .dart_tool \
+            2>/dev/null \
+            | tee \
+              "$GITHUB_WORKSPACE/diagnostics/integration-test-references.txt" \
+            || true
+
+      # ============================================================
+      # ANALYZE
+      # ============================================================
+
+      - name: Flutter analyze
+        shell: bash
+        run: |
+          set +e
+
+          cd "$PROJECT_ROOT"
+
+          flutter analyze \
+            2>&1 \
+            | tee \
+              "$GITHUB_WORKSPACE/diagnostics/flutter-analyze.txt"
+
+          ANALYZE_EXIT=${PIPESTATUS[0]}
+
+          echo
+          echo "flutter analyze exit code: $ANALYZE_EXIT"
+
+          # Do not stop diagnostics here.
+          exit 0
+
+      # ============================================================
+      # FORMAT CHECK
+      # ============================================================
+
+      - name: Dart format check
+        shell: bash
+        run: |
+          set +e
+
+          cd "$PROJECT_ROOT"
+
+          dart format \
+            --output=none \
+            --set-exit-if-changed \
+            lib test \
+            2>&1 \
+            | tee \
+              "$GITHUB_WORKSPACE/diagnostics/dart-format.txt"
+
+          FORMAT_EXIT=${PIPESTATUS[0]}
+
+          echo
+          echo "dart format exit code: $FORMAT_EXIT"
+
+          exit 0
+
+      # ============================================================
+      # UNIT / WIDGET TESTS
+      # ============================================================
+
+      - name: Flutter tests
+        shell: bash
+        run: |
+          set +e
+
+          cd "$PROJECT_ROOT"
+
+          flutter test \
+            --no-pub \
+            2>&1 \
+            | tee \
+              "$GITHUB_WORKSPACE/diagnostics/flutter-test.txt"
+
+          TEST_EXIT=${PIPESTATUS[0]}
+
+          echo
+          echo "flutter test exit code: $TEST_EXIT"
+
+          exit 0
+
+      # ============================================================
+      # DART COMPILE
+      # ============================================================
+
+      - name: Dart compile validation
+        shell: bash
+        run: |
+          set +e
+
+          cd "$PROJECT_ROOT"
+
+          flutter build apk \
+            --debug \
+            --no-pub \
+            --dart-define="API_BASE_URL=${{ secrets.API_BASE_URL || vars.API_BASE_URL }}" \
+            2>&1 \
+            | tee \
+              "$GITHUB_WORKSPACE/diagnostics/debug-build.txt"
+
+          DEBUG_EXIT=${PIPESTATUS[0]}
+
+          echo
+          echo "debug build exit code: $DEBUG_EXIT"
+
+          exit 0
+
+      # ============================================================
+      # GRADLE DIRECT CONFIGURATION
+      # ============================================================
+
+      - name: Gradle environment probe
+        shell: bash
+        run: |
+          set +e
+
+          cd "$PROJECT_ROOT"
+
+          chmod +x android/gradlew
+
+          export GRADLE_USER_HOME="$GITHUB_WORKSPACE/.gradle-diagnostic"
+
+          mkdir -p "$GRADLE_USER_HOME"
+
+          export GRADLE_OPTS="\
+          -Dorg.gradle.daemon=false \
+          -Dorg.gradle.vfs.watch=false \
+          -Dorg.gradle.parallel=false \
+          -Dorg.gradle.caching=false \
+          -Dorg.gradle.configuration-cache=false"
+
+          {
+            echo "===== GRADLE VERSION ====="
+            ./android/gradlew --version
+
+            echo
+            echo "===== GRADLE TASKS ====="
+            ./android/gradlew \
+              :app:tasks \
+              --all \
+              --no-daemon
+
+            echo
+            echo "===== ANDROID DEPENDENCIES ====="
+            ./android/gradlew \
+              :app:dependencies \
+              --configuration releaseRuntimeClasspath \
+              --no-daemon
+          } 2>&1 \
+          | tee \
+            "$GITHUB_WORKSPACE/diagnostics/gradle-environment.txt"
+
+          exit 0
+
+      # ============================================================
+      # DIRECT GRADLE RELEASE BUILD
+      # ============================================================
+
+      - name: Direct Gradle assembleRelease
+        shell: bash
+        run: |
+          set +e
+
+          cd "$PROJECT_ROOT"
+
+          chmod +x android/gradlew
+
+          export GRADLE_USER_HOME="$GITHUB_WORKSPACE/.gradle-direct"
+
+          mkdir -p "$GRADLE_USER_HOME"
+
+          export GRADLE_OPTS="\
+          -Dorg.gradle.daemon=false \
+          -Dorg.gradle.vfs.watch=false \
+          -Dorg.gradle.parallel=false \
+          -Dorg.gradle.caching=false \
+          -Dorg.gradle.configuration-cache=false"
+
+          echo
+          echo "============================================================"
+          echo "DIRECT GRADLE RELEASE BUILD"
+          echo "============================================================"
+
+          ./android/gradlew \
+            :app:assembleRelease \
+            --no-daemon \
+            --stacktrace \
+            --info \
+            --console=plain \
+            2>&1 \
+            | tee \
+              "$GITHUB_WORKSPACE/diagnostics/direct-gradle-release.log"
+
+          GRADLE_EXIT=${PIPESTATUS[0]}
+
+          echo
+          echo "DIRECT GRADLE EXIT CODE: $GRADLE_EXIT"
+
+          echo
+          echo "===== BUILD OUTPUTS ====="
+
+          find build \
+            android/app/build \
+            -type f \
+            \( \
+              -name '*.apk' \
+              -o \
+              -name '*.aab' \
+              -o \
+              -name '*.log' \
+            \) \
+            2>/dev/null \
+            | sort \
+            | tee \
+              "$GITHUB_WORKSPACE/diagnostics/gradle-build-outputs.txt"
+
+          exit 0
+
+      # ============================================================
+      # FLUTTER VERBOSE RELEASE BUILD
+      # ============================================================
+
+      - name: Flutter verbose release build
+        shell: bash
+        run: |
+          set +e
+
+          cd "$PROJECT_ROOT"
+
+          export GRADLE_USER_HOME="$GITHUB_WORKSPACE/.gradle-flutter"
+
+          mkdir -p "$GRADLE_USER_HOME"
+
+          export GRADLE_OPTS="\
+          -Dorg.gradle.daemon=false \
+          -Dorg.gradle.vfs.watch=false \
+          -Dorg.gradle.parallel=false \
+          -Dorg.gradle.caching=false \
+          -Dorg.gradle.configuration-cache=false"
+
+          flutter build apk \
+            --release \
+            --no-pub \
+            --verbose \
+            --dart-define="API_BASE_URL=${{ secrets.API_BASE_URL || vars.API_BASE_URL }}" \
+            --dart-define="BUILD_PROFILE=pilot" \
+            2>&1 \
+            | tee \
+              "$GITHUB_WORKSPACE/diagnostics/flutter-release-verbose.log"
+
+          FLUTTER_EXIT=${PIPESTATUS[0]}
+
+          echo
+          echo "FLUTTER RELEASE EXIT CODE: $FLUTTER_EXIT"
+
+          exit 0
+
+      # ============================================================
+      # APK DISCOVERY
+      # ============================================================
+
+      - name: APK discovery and validation
+        shell: bash
+        run: |
+          set +e
+
+          cd "$PROJECT_ROOT"
+
+          echo "===== ALL APK FILES ====="
+
+          find . \
+            -type f \
+            -name '*.apk' \
+            | sort \
+            | tee \
+              "$GITHUB_WORKSPACE/diagnostics/all-apks.txt"
+
+          echo
+          echo "===== APK METADATA ====="
+
+          while IFS= read -r APK; do
+
+            [[ -f "$APK" ]] || continue
+
+            echo
+            echo "APK: $APK"
+
+            SIZE="$(stat -c%s "$APK" 2>/dev/null || echo 0)"
+
+            echo "SIZE: $SIZE"
+
+            file "$APK" || true
+
+            echo "SHA256:"
+
+            sha256sum "$APK" || true
+
+            echo "AAPT BADGING:"
+
+            "$ANDROID_HOME/build-tools/37.0.0/aapt" \
+              dump badging \
+              "$APK" \
+              2>&1 \
+              | head -100 \
+              || true
+
+          done < \
+            "$GITHUB_WORKSPACE/diagnostics/all-apks.txt"
+
+      # ============================================================
+      # SOURCE TREE SNAPSHOT
+      # ============================================================
+
+      - name: Capture project diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          cd "$GITHUB_WORKSPACE"
+
+          {
+            echo "===== GIT ====="
+            git rev-parse HEAD
+
+            echo
+            echo "===== PROJECT ROOT ====="
+            echo "PROJECT_ROOT=$PROJECT_ROOT"
+
+            echo
+            echo "===== GENERATED FILES ====="
+
+            find "$PROJECT_ROOT" \
+              -type f \
+              \( \
+                -name 'GeneratedPluginRegistrant.java' \
+                -o \
+                -name '*.lock' \
+                -o \
+                -name '*.gradle' \
+                -o \
+                -name '*.gradle.kts' \
+              \) \
+              | sort
+
+            echo
+            echo "===== APK OUTPUTS ====="
+
+            find "$PROJECT_ROOT" \
+              -type f \
+              -name '*.apk' \
+              | sort
+
+          } 2>&1 \
+            | tee \
+              diagnostics/project-snapshot.txt
+
+      # ============================================================
+      # UPLOAD EVERYTHING
+      # ============================================================
+
+      - name: Upload diagnostic artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-diagnostic-probe
+          path: diagnostics
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ============================================================
+      # FAIL INTENTIONALLY
+      # ============================================================
+
+      - name: Diagnostic result
+        if: always()
+        shell: bash
+        run: |
+          echo
+          echo "============================================================"
+          echo "HOPE DIAGNOSTIC PROBE COMPLETE"
+          echo "============================================================"
+          echo
+          echo "This workflow intentionally does not decide the final"
+          echo "release status."
+          echo
+          echo "Inspect the uploaded diagnostic artifacts before changing"
+          echo "the production/bootstrap workflow."
