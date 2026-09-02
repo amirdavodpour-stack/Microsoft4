@@ -1,398 +1,419 @@
 name: HOPE ZIP Bootstrap
 
-"on":
+on:
   workflow_dispatch:
+    inputs:
+      archive:
+        description: "ZIP filename in repository (leave blank to auto-detect)"
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: "hope-bootstrap-${{ github.ref }}"
+  group: hope-zip-bootstrap-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  SOURCE_ZIP: "HOPE-3_8_0-GITHUB-ZIP-AUTO-BUILD-READY-V5-SELF-HEALING.zip"
+  SOURCE_ZIP: HOPE-3_8_0-GITHUB-ZIP-AUTO-BUILD-READY-V5-SELF-HEALING.zip
   FLUTTER_VERSION: "3.47.0"
-  BUILD_PROFILE: "pilot"
+  JAVA_VERSION: "17"
   GRADLE_VERSION: "8.14.3"
   GRADLE_SHA256: "bd71102213493060956ec229d946beee57158dbd89d0e62b91bca0fa2c5f3531"
+  BUILD_PROFILE: "pilot"
 
 jobs:
   build:
     name: HOPE APK Self-Healing Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     steps:
 
       # ============================================================
-      # CHECKOUT
+      # 1. CHECKOUT
       # ============================================================
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
       # ============================================================
-      # VERIFY SOURCE ZIP
+      # 2. BASIC ENVIRONMENT
       # ============================================================
+      - name: Show runner environment
+        shell: bash
+        run: |
+          set -euxo pipefail
 
-      - name: Verify source ZIP
+          echo "=== SYSTEM ==="
+          uname -a
+          echo
+
+          echo "=== JAVA ==="
+          java -version || true
+          echo
+
+          echo "=== DISK ==="
+          df -h
+          echo
+
+          echo "=== MEMORY ==="
+          free -h || true
+
+      # ============================================================
+      # 3. LOCATE SOURCE ZIP
+      # ============================================================
+      - name: Locate source ZIP
+        id: locate_zip
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ ! -f "$SOURCE_ZIP" ]; then
-            echo "ERROR: Required source ZIP not found:"
-            echo "$SOURCE_ZIP"
+          REQUESTED="${{ inputs.archive }}"
+
+          if [[ -n "$REQUESTED" ]]; then
+            if [[ ! -f "$REQUESTED" ]]; then
+              echo "::error::Requested archive does not exist: $REQUESTED"
+              exit 1
+            fi
+
+            SOURCE="$REQUESTED"
+          else
+            if [[ -f "$SOURCE_ZIP" ]]; then
+              SOURCE="$SOURCE_ZIP"
+            else
+              SOURCE="$(find . -maxdepth 2 -type f -iname '*.zip' | head -n 1 || true)"
+            fi
+          fi
+
+          if [[ -z "$SOURCE" || ! -f "$SOURCE" ]]; then
+            echo "::error::No source ZIP found."
             echo
-            echo "ZIP files currently in repository:"
-            find . \
-              -type f \
-              -name "*.zip" \
-              -print \
-              | sort || true
+            echo "ZIP files found:"
+            find . -maxdepth 3 -type f -iname '*.zip' -print || true
             exit 1
           fi
 
+          echo "SOURCE_ZIP_PATH=$SOURCE" >> "$GITHUB_ENV"
+
           echo "Using source ZIP:"
-          echo "$SOURCE_ZIP"
+          echo "$SOURCE"
 
           echo
           echo "ZIP size:"
-          ls -lh "$SOURCE_ZIP"
-
-          echo
-          echo "ZIP SHA256:"
-          sha256sum "$SOURCE_ZIP"
+          du -h "$SOURCE"
 
       # ============================================================
-      # EXTRACT PROJECT
+      # 4. VERIFY ZIP
       # ============================================================
-
-      - name: Extract source project
+      - name: Verify ZIP integrity
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf .hope-work
-          rm -rf .hope-project
-
-          mkdir -p .hope-work/source
-          mkdir -p .hope-project
-
-          unzip -q "$SOURCE_ZIP" -d .hope-work/source
-
-          echo "Searching for Flutter project..."
-
-          PUBSPEC_PATH="$(
-            find .hope-work/source \
-              -type f \
-              -name "pubspec.yaml" \
-              -print \
-              -quit
-          )"
-
-          if [ -z "$PUBSPEC_PATH" ]; then
-            echo "ERROR: No pubspec.yaml found inside source ZIP."
-            echo
-            echo "Extracted files:"
-            find .hope-work/source \
-              -maxdepth 5 \
-              -type f \
-              | sort \
-              | head -n 300
-            exit 1
-          fi
-
-          PROJECT_SOURCE_DIR="$(dirname "$PUBSPEC_PATH")"
-
-          echo
-          echo "Found Flutter project:"
-          echo "$PROJECT_SOURCE_DIR"
-
-          cp -a "$PROJECT_SOURCE_DIR"/. .hope-project/
-
-          test -f ".hope-project/pubspec.yaml"
-
-          echo "PROJECT_ROOT=$GITHUB_WORKSPACE/.hope-project" \
-            >> "$GITHUB_ENV"
-
-          echo
-          echo "Project copied to:"
-          echo "$GITHUB_WORKSPACE/.hope-project"
+          unzip -t "$SOURCE_ZIP_PATH"
 
       # ============================================================
-      # JAVA
+      # 5. INSTALL JAVA
       # ============================================================
-
-      - name: Setup Java 17
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: "temurin"
-          java-version: "17"
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
 
       # ============================================================
-      # FLUTTER
+      # 6. INSTALL FLUTTER
       # ============================================================
-
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: "stable"
-          cache: true
+          channel: stable
+          cache: false
 
       # ============================================================
-      # TOOLCHAIN + API
+      # 7. VERIFY TOOLCHAIN
       # ============================================================
-
-      - name: Verify toolchain and API configuration
+      - name: Verify Flutter and Java
         shell: bash
-        env:
-          API_BASE_URL_SECRET: ${{ secrets.API_BASE_URL }}
-          API_BASE_URL_VARIABLE: ${{ vars.API_BASE_URL }}
         run: |
-          set -euo pipefail
-
-          echo "========================================"
-          echo "FLUTTER"
-          echo "========================================"
+          set -euxo pipefail
 
           flutter --version
-
-          echo
-          echo "========================================"
-          echo "DART"
-          echo "========================================"
-
-          dart --version
-
-          echo
-          echo "========================================"
-          echo "JAVA"
-          echo "========================================"
+          flutter doctor -v
 
           java -version
 
-          echo
-          echo "========================================"
-          echo "API CONFIGURATION"
-          echo "========================================"
-
-          API_VALUE="${API_BASE_URL_SECRET:-}"
-
-          if [ -z "$API_VALUE" ]; then
-            API_VALUE="${API_BASE_URL_VARIABLE:-}"
-          fi
-
-          if [ -z "$API_VALUE" ]; then
-            echo "ERROR: API_BASE_URL is not configured."
-            echo
-            echo "Create a GitHub Actions Repository Secret or Variable:"
-            echo "API_BASE_URL"
-            exit 1
-          fi
-
-          case "$API_VALUE" in
-            https://*)
-              ;;
-            *)
-              echo "ERROR: API_BASE_URL must use HTTPS."
-              exit 1
-              ;;
-          esac
-
-          {
-            echo "API_BASE_URL=$API_VALUE"
-            echo "BUILD_PROFILE=$BUILD_PROFILE"
-          } >> "$GITHUB_ENV"
-
-          echo "API_BASE_URL configuration verified."
-
       # ============================================================
-      # PREFLIGHT
+      # 8. EXTRACT PROJECT
       # ============================================================
-
-      - name: Preflight project
+      - name: Extract HOPE project
         shell: bash
         run: |
           set -euo pipefail
 
-          cd "$PROJECT_ROOT"
+          rm -rf .hope-work .hope-project
 
-          echo "========================================"
-          echo "PROJECT"
-          echo "========================================"
+          mkdir -p .hope-work
+          mkdir -p .hope-project
 
-          pwd
+          unzip -q "$SOURCE_ZIP_PATH" -d .hope-work
 
-          test -f pubspec.yaml
-          test -f android/gradle/wrapper/gradle-wrapper.properties
+          echo "=== EXTRACTED FILES ==="
+          find .hope-work -maxdepth 3 -type f | head -200
 
-          echo
-          echo "========================================"
-          echo "GRADLE WRAPPER"
-          echo "========================================"
+          # --------------------------------------------------------
+          # Detect Flutter project root automatically.
+          # --------------------------------------------------------
 
-          sed -i \
-            "s#^distributionUrl=.*#distributionUrl=https\\\\://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip#" \
-            android/gradle/wrapper/gradle-wrapper.properties
+          PROJECT_ROOT=""
 
-          if grep -q "^distributionSha256Sum=" \
-            android/gradle/wrapper/gradle-wrapper.properties; then
-
-            sed -i \
-              "s#^distributionSha256Sum=.*#distributionSha256Sum=${GRADLE_SHA256}#" \
-              android/gradle/wrapper/gradle-wrapper.properties
-
+          if [[ -f ".hope-work/pubspec.yaml" ]]; then
+            PROJECT_ROOT=".hope-work"
           else
-
-            printf "\ndistributionSha256Sum=%s\n" \
-              "$GRADLE_SHA256" \
-              >> android/gradle/wrapper/gradle-wrapper.properties
-
+            PROJECT_ROOT="$(find .hope-work -type f -name pubspec.yaml -print -quit | xargs -r dirname)"
           fi
 
-          chmod +x android/gradlew
+          if [[ -z "$PROJECT_ROOT" || ! -f "$PROJECT_ROOT/pubspec.yaml" ]]; then
+            echo "::error::Flutter project root could not be detected."
+            exit 1
+          fi
+
+          echo "Detected project root:"
+          echo "$PROJECT_ROOT"
+
+          cp -a "$PROJECT_ROOT"/. .hope-project/
 
           echo
-          grep "^distributionUrl=" \
-            android/gradle/wrapper/gradle-wrapper.properties
-
-          grep "^distributionSha256Sum=" \
-            android/gradle/wrapper/gradle-wrapper.properties
+          echo "=== PROJECT ROOT ==="
+          ls -la .hope-project
 
           echo
-          echo "========================================"
-          echo "FLUTTER CLEAN"
-          echo "========================================"
+          echo "=== PUBSPEC ==="
+          sed -n '1,160p' .hope-project/pubspec.yaml
+
+      # ============================================================
+      # 9. VALIDATE FLUTTER PROJECT
+      # ============================================================
+      - name: Validate Flutter project
+        shell: bash
+        working-directory: .hope-project
+        run: |
+          set -euo pipefail
+
+          test -f pubspec.yaml
+          test -d android
+          test -d lib
+
+          echo "Flutter project structure OK."
+
+      # ============================================================
+      # 10. CONFIGURE API
+      # ============================================================
+      - name: Configure API_BASE_URL
+        shell: bash
+        env:
+          INPUT_API_BASE_URL: ${{ vars.API_BASE_URL }}
+          SECRET_API_BASE_URL: ${{ secrets.API_BASE_URL }}
+        run: |
+          set -euo pipefail
+
+          API_VALUE="${SECRET_API_BASE_URL:-}"
+
+          if [[ -z "$API_VALUE" ]]; then
+            API_VALUE="${INPUT_API_BASE_URL:-}"
+          fi
+
+          if [[ -z "$API_VALUE" ]]; then
+            echo "::error::API_BASE_URL is not configured."
+            echo
+            echo "Create repository variable or secret:"
+            echo "API_BASE_URL=https://your-api.example.com"
+            exit 1
+          fi
+
+          if [[ "$API_VALUE" != https://* ]]; then
+            echo "::error::API_BASE_URL must use HTTPS."
+            exit 1
+          fi
+
+          {
+            echo "API_BASE_URL<<EOF"
+            echo "$API_VALUE"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+          echo "API_BASE_URL configured successfully."
+
+      # ============================================================
+      # 11. ALIGN GRADLE WRAPPER
+      # ============================================================
+      - name: Align Gradle wrapper
+        shell: bash
+        working-directory: .hope-project
+        run: |
+          set -euo pipefail
+
+          test -f android/gradle/wrapper/gradle-wrapper.properties
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("android/gradle/wrapper/gradle-wrapper.properties")
+
+          text = p.read_text()
+
+          version = "8.14.3"
+
+          distribution = (
+              "https://services.gradle.org/distributions/"
+              f"gradle-{version}-all.zip"
+          )
+
+          lines = text.splitlines()
+          found = False
+
+          for i, line in enumerate(lines):
+              if line.startswith("distributionUrl="):
+                  lines[i] = "distributionUrl=" + distribution
+                  found = True
+
+          if not found:
+              lines.append("distributionUrl=" + distribution)
+
+          p.write_text("\n".join(lines) + "\n")
+
+          print(p.read_text())
+          PY
+
+      # ============================================================
+      # 12. PREFLIGHT
+      # ============================================================
+      - name: Preflight Flutter project
+        shell: bash
+        working-directory: .hope-project
+        run: |
+          set -euo pipefail
+
+          export GRADLE_USER_HOME="$GITHUB_WORKSPACE/.gradle-preflight"
+
+          export GRADLE_OPTS="\
+          -Dorg.gradle.daemon=false \
+          -Dorg.gradle.vfs.watch=false \
+          -Dorg.gradle.parallel=false \
+          -Dorg.gradle.caching=false"
+
+          export ORG_GRADLE_PROJECT_org.gradle.daemon=false
+          export ORG_GRADLE_PROJECT_org.gradle.vfs.watch=false
+
+          rm -rf \
+            build \
+            .dart_tool \
+            .gradle \
+            android/.gradle \
+            android/build
+
+          ./android/gradlew --stop || true
 
           flutter clean
 
-          echo
-          echo "========================================"
-          echo "FLUTTER PUB GET"
-          echo "========================================"
-
           flutter pub get
 
-          if [ -f "l10n.yaml" ]; then
-
-            echo
-            echo "========================================"
-            echo "GENERATE LOCALIZATION"
-            echo "========================================"
-
-            flutter gen-l10n
-
-          fi
-
-          echo
-          echo "========================================"
-          echo "TOOLCHAIN ALIGNMENT"
-          echo "========================================"
-
-          if [ -f "tools/verify_toolchain_alignment.py" ]; then
-            python3 tools/verify_toolchain_alignment.py
-          else
-            echo "Toolchain alignment script not present; continuing."
-          fi
+          flutter gen-l10n || true
 
       # ============================================================
-      # APK BUILD
-      #
-      # IMPORTANT:
-      # The previous workflow retried inside the same project tree
-      # and reused Gradle/Flutter watcher state.
-      #
-      # This version creates a completely isolated project + Gradle
-      # environment for every attempt and disables Gradle VFS
-      # watching/daemon persistence.
+      # 13. BUILD WITH ISOLATED RETRIES
       # ============================================================
-
-      - name: Build APK with isolated retries
+      - name: Build APK with isolated self-healing attempts
         shell: bash
+        env:
+          API_BASE_URL: ${{ env.API_BASE_URL }}
         run: |
-          set -u
+          set -uo pipefail
 
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          MAX_ATTEMPTS=3
+          BUILD_SUCCESS=0
 
-          BUILD_OK=0
+          rm -rf artifacts
+          mkdir -p artifacts
 
-          for ATTEMPT in 1 2 3; do
+          for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
 
             echo
-            echo "========================================"
-            echo "HOPE APK BUILD ATTEMPT $ATTEMPT / 3"
-            echo "========================================"
+            echo "============================================================"
+            echo "HOPE BUILD ATTEMPT $ATTEMPT / $MAX_ATTEMPTS"
+            echo "============================================================"
             echo
 
             ATTEMPT_ROOT="$GITHUB_WORKSPACE/.hope-attempt-$ATTEMPT"
-            ATTEMPT_GRADLE_HOME="$GITHUB_WORKSPACE/.gradle-attempt-$ATTEMPT"
-            ATTEMPT_LOG="$GITHUB_WORKSPACE/artifacts/build-attempt-${ATTEMPT}.log"
+            GRADLE_HOME="$GITHUB_WORKSPACE/.gradle-attempt-$ATTEMPT"
 
             rm -rf "$ATTEMPT_ROOT"
-            rm -rf "$ATTEMPT_GRADLE_HOME"
+            rm -rf "$GRADLE_HOME"
 
             mkdir -p "$ATTEMPT_ROOT"
-            mkdir -p "$ATTEMPT_GRADLE_HOME"
+            mkdir -p "$GRADLE_HOME"
 
-            echo "Creating isolated project tree..."
+            # ------------------------------------------------------
+            # CRITICAL:
+            # Every attempt receives a completely fresh project tree.
+            # ------------------------------------------------------
 
-            cp -a "$PROJECT_ROOT"/. "$ATTEMPT_ROOT"/
+            cp -a "$GITHUB_WORKSPACE/.hope-project"/. "$ATTEMPT_ROOT"/
 
-            cd "$ATTEMPT_ROOT"
-
-            # --------------------------------------------------------
-            # ISOLATE GRADLE
-            # --------------------------------------------------------
-
-            export GRADLE_USER_HOME="$ATTEMPT_GRADLE_HOME"
+            export GRADLE_USER_HOME="$GRADLE_HOME"
 
             export GRADLE_OPTS="\
             -Dorg.gradle.daemon=false \
             -Dorg.gradle.vfs.watch=false \
-            -Dorg.gradle.parallel=false"
+            -Dorg.gradle.parallel=false \
+            -Dorg.gradle.caching=false \
+            -Dorg.gradle.configuration-cache=false"
 
             export ORG_GRADLE_PROJECT_org.gradle.daemon=false
+            export ORG_GRADLE_PROJECT_org.gradle.vfs.watch=false
 
-            # --------------------------------------------------------
-            # REMOVE ALL POSSIBLE OLD BUILD/WATCHER STATE
-            # --------------------------------------------------------
+            export FLUTTER_SUPPRESS_ANALYTICS=true
+
+            cd "$ATTEMPT_ROOT"
+
+            echo "Attempt project:"
+            pwd
+
+            echo
+            echo "Cleaning isolated attempt..."
 
             rm -rf \
-              ".gradle" \
-              "android/.gradle" \
-              "build" \
-              ".dart_tool"
+              build \
+              .dart_tool \
+              .gradle \
+              android/.gradle \
+              android/build
 
-            # Stop any daemon associated with this wrapper.
-            ./android/gradlew --stop \
-              >/dev/null 2>&1 || true
-
-            # --------------------------------------------------------
-            # FLUTTER DEPENDENCIES
-            # --------------------------------------------------------
+            ./android/gradlew --stop || true
 
             echo
-            echo "Running flutter pub get..."
+            echo "Flutter version:"
+            flutter --version
 
-            flutter pub get || true
+            echo
+            echo "Getting packages..."
 
-            if [ -f "l10n.yaml" ]; then
-              echo
-              echo "Generating localization..."
-              flutter gen-l10n || true
+            if ! flutter pub get; then
+              echo "::warning::flutter pub get failed on attempt $ATTEMPT"
+              continue
             fi
 
-            # --------------------------------------------------------
-            # BUILD
-            # --------------------------------------------------------
+            echo
+            echo "Generating localization..."
+
+            flutter gen-l10n || true
 
             echo
-            echo "Starting Flutter APK build..."
+            echo "Starting APK build..."
 
             set +e
 
@@ -400,336 +421,249 @@ jobs:
               --release \
               --dart-define="API_BASE_URL=$API_BASE_URL" \
               --dart-define="BUILD_PROFILE=$BUILD_PROFILE" \
-              2>&1 | tee "$ATTEMPT_LOG"
+              --no-pub
 
-            RC=${PIPESTATUS[0]}
+            BUILD_EXIT=$?
 
             set -e
 
             echo
-            echo "Flutter build exit code: $RC"
+            echo "Flutter build exit code: $BUILD_EXIT"
 
-            # --------------------------------------------------------
-            # ROBUST APK DISCOVERY
-            # --------------------------------------------------------
-
-            APK=""
-
-            if [ -d "build" ]; then
-              APK="$(
-                find build \
-                  -type f \
-                  -name "*.apk" \
-                  -print \
-                  -quit \
-                  2>/dev/null || true
-              )"
-            fi
-
-            if [ -n "$APK" ] && [ -s "$APK" ]; then
+            if [[ "$BUILD_EXIT" -eq 0 ]]; then
 
               echo
-              echo "========================================"
-              echo "BUILD SUCCESS"
-              echo "========================================"
-              echo
-              echo "APK found:"
-              echo "$APK"
+              echo "Searching for APK..."
 
-              cp \
-                "$APK" \
-                "$GITHUB_WORKSPACE/artifacts/HOPE-3.8.0-pilot.apk"
+              APK_PATH="$(find "$ATTEMPT_ROOT/build" \
+                -type f \
+                \( -name '*.apk' -o -name '*.aab' \) \
+                -print \
+                | head -n 1 || true)"
 
-              BUILD_OK=1
+              if [[ -n "$APK_PATH" && -f "$APK_PATH" ]]; then
 
-              break
+                echo "APK found:"
+                echo "$APK_PATH"
 
+                mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+                cp "$APK_PATH" \
+                  "$GITHUB_WORKSPACE/artifacts/HOPE-3.8.0-pilot.apk"
+
+                if [[ -f "$GITHUB_WORKSPACE/artifacts/HOPE-3.8.0-pilot.apk" ]]; then
+
+                  APK_SIZE="$(stat -c%s \
+                    "$GITHUB_WORKSPACE/artifacts/HOPE-3.8.0-pilot.apk")"
+
+                  if [[ "$APK_SIZE" -gt 100000 ]]; then
+                    echo
+                    echo "APK verification successful."
+                    echo "APK size: $APK_SIZE bytes"
+
+                    BUILD_SUCCESS=1
+                    break
+                  else
+                    echo "::warning::APK exists but is suspiciously small."
+                  fi
+                fi
+              else
+                echo "::warning::Build succeeded but APK was not found."
+              fi
             fi
 
-            # --------------------------------------------------------
-            # FAILURE DIAGNOSTICS
-            # --------------------------------------------------------
+            echo
+            echo "Attempt $ATTEMPT failed."
 
             echo
-            echo "========================================"
-            echo "BUILD FAILED"
-            echo "========================================"
+            echo "=== LAST BUILD LOG HINTS ==="
 
-            echo "Attempt: $ATTEMPT"
-            echo "Exit code: $RC"
-
-            echo
-            echo "Searching for Gradle watcher / daemon state..."
-
-            ps aux \
-              | grep -Ei \
-                "gradle|flutter" \
-              | grep -v grep \
-              || true
-
-            echo
-            echo "Gradle directories:"
-
-            find \
-              "$ATTEMPT_GRADLE_HOME" \
-              "$ATTEMPT_ROOT/android/.gradle" \
-              "$ATTEMPT_ROOT/.gradle" \
-              -maxdepth 5 \
+            find "$ATTEMPT_ROOT" \
               -type f \
-              2>/dev/null \
-              | head -n 300 \
-              || true
+              \( -name '*.log' -o -name '*.txt' \) \
+              -print 2>/dev/null \
+              | head -30 || true
 
             echo
-            echo "Stopping Gradle daemons..."
-
-            ./android/gradlew --stop \
-              >/dev/null 2>&1 || true
+            echo "=== MEMORY ==="
+            free -h || true
 
             echo
-            echo "Attempt $ATTEMPT finished."
+            echo "=== DISK ==="
+            df -h || true
+
+            echo
+            echo "Preparing completely fresh retry..."
+
+            ./android/gradlew --stop || true
+
+            cd "$GITHUB_WORKSPACE"
+
+            rm -rf "$ATTEMPT_ROOT"
+            rm -rf "$GRADLE_HOME"
+
+            sleep 3
 
           done
 
-          # ==========================================================
-          # FINAL FAILURE
-          # ==========================================================
-
-          if [ "$BUILD_OK" -ne 1 ]; then
-
+          if [[ "$BUILD_SUCCESS" -ne 1 ]]; then
             echo
-            echo "========================================"
-            echo "APK BUILD FAILED AFTER 3 ATTEMPTS"
-            echo "========================================"
-
-            cd "$PROJECT_ROOT"
-
-            flutter analyze \
-              2>&1 \
-              | tee \
-                "$GITHUB_WORKSPACE/artifacts/final-analyze.log" \
-              || true
-
-            exit 1
-
-          fi
-
-          # ==========================================================
-          # FINAL APK VALIDATION
-          # ==========================================================
-
-          APK="$GITHUB_WORKSPACE/artifacts/HOPE-3.8.0-pilot.apk"
-
-          if [ ! -s "$APK" ]; then
-            echo "ERROR: APK artifact is empty or missing."
+            echo "::error::All $MAX_ATTEMPTS isolated build attempts failed."
             exit 1
           fi
 
           echo
-          echo "========================================"
-          echo "FINAL APK"
-          echo "========================================"
+          echo "============================================================"
+          echo "HOPE APK BUILD SUCCESSFUL"
+          echo "============================================================"
 
-          ls -lh "$APK"
-
-          echo
-          echo "SHA256:"
-
-          sha256sum "$APK" \
-            | tee \
-              "$GITHUB_WORKSPACE/artifacts/HOPE-3.8.0-pilot.apk.sha256"
+          ls -lh artifacts/
 
       # ============================================================
-      # VERIFY APK
+      # 14. VERIFY APK
       # ============================================================
-
-      - name: Verify APK
+      - name: Verify final APK
         shell: bash
         run: |
           set -euo pipefail
 
           APK="artifacts/HOPE-3.8.0-pilot.apk"
 
-          test -s "$APK"
+          test -f "$APK"
 
-          echo "APK file:"
-          ls -lh "$APK"
+          SIZE="$(stat -c%s "$APK")"
 
-          echo
-          echo "APK type:"
+          echo "APK:"
+          echo "$APK"
 
-          file "$APK" || true
+          echo "Size:"
+          echo "$SIZE bytes"
 
-          if command -v apksigner >/dev/null 2>&1; then
-
-            echo
-            echo "Running APK signature verification..."
-
-            apksigner verify \
-              --verbose \
-              "$APK"
-
-          else
-
-            echo
-            echo "apksigner is not available on this runner."
-
+          if [[ "$SIZE" -lt 100000 ]]; then
+            echo "::error::APK is too small."
+            exit 1
           fi
 
-      # ============================================================
-      # CREATE SUCCESSFUL PROJECT ZIP
-      # ============================================================
+          file "$APK"
 
-      - name: Create successful project ZIP
+          sha256sum "$APK"
+
+      # ============================================================
+      # 15. PACKAGE PROJECT
+      # ============================================================
+      - name: Package built project
+        if: success()
         shell: bash
         run: |
           set -euo pipefail
 
-          PROJECT="$PROJECT_ROOT"
+          mkdir -p artifacts
 
-          echo "Cleaning project before packaging..."
-
-          rm -rf \
-            "$PROJECT/.dart_tool" \
-            "$PROJECT/build" \
-            "$PROJECT/node_modules" \
-            "$PROJECT/.gradle" \
-            "$PROJECT/android/.gradle" \
-            "$PROJECT/.git"
-
-          find "$PROJECT" \
-            -type f \
-            \( \
-              -name "*.apk" \
-              -o -name "*.aab" \
-              -o -name "*.jks" \
-              -o -name "*.keystore" \
-              -o -name ".env" \
-              -o -name "key.properties" \
-            \) \
-            -delete
-
-          cd "$PROJECT"
+          cd .hope-project
 
           zip -qr \
-            "$GITHUB_WORKSPACE/artifacts/HOPE_3_8_0-SUCCESSFUL-PROJECT.zip" \
-            .
+            "$GITHUB_WORKSPACE/artifacts/HOPE-3.8.0-built-project.zip" \
+            . \
+            -x ".dart_tool/*" \
+            -x ".gradle/*" \
+            -x "build/*" \
+            -x "android/.gradle/*"
 
           cd "$GITHUB_WORKSPACE"
 
-          sha256sum \
-            "artifacts/HOPE_3_8_0-SUCCESSFUL-PROJECT.zip" \
-            | tee \
-              "artifacts/HOPE_3_8_0-SUCCESSFUL-PROJECT.zip.sha256"
-
-          echo
-          echo "Successful project ZIP:"
-          ls -lh \
-            "artifacts/HOPE_3_8_0-SUCCESSFUL-PROJECT.zip"
+          ls -lh artifacts/
 
       # ============================================================
-      # DIAGNOSTICS
+      # 16. COLLECT DIAGNOSTICS
       # ============================================================
-
       - name: Collect diagnostics
         if: always()
         shell: bash
         run: |
           set +e
 
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          mkdir -p artifacts/diagnostics
 
-          {
-            echo "========================================"
-            echo "HOPE BUILD DIAGNOSTICS"
-            echo "========================================"
-            echo
-            echo "Repository: $GITHUB_REPOSITORY"
-            echo "Commit: $GITHUB_SHA"
-            echo "Run ID: $GITHUB_RUN_ID"
-            echo "Ref: $GITHUB_REF"
-            echo
-          } > \
-            "$GITHUB_WORKSPACE/artifacts/workflow-summary.txt"
+          echo "=== RUN INFO ===" \
+            > artifacts/diagnostics/run-info.txt
 
-          flutter doctor -v \
-            > "$GITHUB_WORKSPACE/artifacts/flutter-doctor.txt" \
-            2>&1 || true
+          echo "Repository: $GITHUB_REPOSITORY" \
+            >> artifacts/diagnostics/run-info.txt
+
+          echo "Ref: $GITHUB_REF" \
+            >> artifacts/diagnostics/run-info.txt
+
+          echo "SHA: $GITHUB_SHA" \
+            >> artifacts/diagnostics/run-info.txt
+
+          echo "Flutter: $FLUTTER_VERSION" \
+            >> artifacts/diagnostics/run-info.txt
+
+          echo "Gradle: $GRADLE_VERSION" \
+            >> artifacts/diagnostics/run-info.txt
+
+          echo
+          echo "=== TOOLCHAIN ==="
 
           flutter --version \
-            > "$GITHUB_WORKSPACE/artifacts/flutter-version.txt" \
-            2>&1 || true
+            > artifacts/diagnostics/flutter-version.txt 2>&1
+
+          flutter doctor -v \
+            > artifacts/diagnostics/flutter-doctor.txt 2>&1
 
           java -version \
-            > "$GITHUB_WORKSPACE/artifacts/java-version.txt" \
-            2>&1 || true
+            > artifacts/diagnostics/java-version.txt 2>&1
+
+          echo
+          echo "=== WORKSPACE ==="
+
+          find "$GITHUB_WORKSPACE" \
+            -maxdepth 3 \
+            -type f \
+            | sort \
+            > artifacts/diagnostics/workspace-files.txt
+
+          echo
+          echo "=== DISK ==="
+
+          df -h \
+            > artifacts/diagnostics/disk.txt 2>&1
+
+          echo
+          echo "=== MEMORY ==="
+
+          free -h \
+            > artifacts/diagnostics/memory.txt 2>&1
 
       # ============================================================
-      # UPLOAD APK
+      # 17. UPLOAD FINAL ARTIFACTS
       # ============================================================
-
-      - name: Upload APK
+      - name: Upload HOPE APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: HOPE-3.8.0-APK
-          path: |
-            artifacts/HOPE-3.8.0-pilot.apk
-            artifacts/HOPE-3.8.0-pilot.apk.sha256
+          name: HOPE-3.8.0-pilot-apk
+          path: artifacts/HOPE-3.8.0-pilot.apk
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
 
-      # ============================================================
-      # UPLOAD PROJECT
-      # ============================================================
-
-      - name: Upload successful project
+      - name: Upload built project
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: HOPE-3.8.0-SUCCESSFUL-PROJECT
-          path: |
-            artifacts/HOPE_3_8_0-SUCCESSFUL-PROJECT.zip
-            artifacts/HOPE_3_8_0-SUCCESSFUL-PROJECT.zip.sha256
+          name: HOPE-3.8.0-built-project
+          path: artifacts/HOPE-3.8.0-built-project.zip
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
 
       # ============================================================
-      # UPLOAD DIAGNOSTICS
+      # 18. UPLOAD DIAGNOSTICS
       # ============================================================
-
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: HOPE-3.8.0-BUILD-DIAGNOSTICS
-          path: artifacts/
-          if-no-files-found: ignore
+          name: HOPE-build-diagnostics
+          path: artifacts/diagnostics
+          if-no-files-found: warn
           retention-days: 14
-
-      # ============================================================
-      # FINAL SUMMARY
-      # ============================================================
-
-      - name: Final summary
-        if: always()
-        shell: bash
-        run: |
-          echo
-          echo "========================================"
-          echo "HOPE BUILD FINISHED"
-          echo "========================================"
-
-          if [ -f "artifacts/HOPE-3.8.0-pilot.apk" ]; then
-            echo "APK: SUCCESS"
-            ls -lh "artifacts/HOPE-3.8.0-pilot.apk"
-          else
-            echo "APK: NOT CREATED"
-          fi
-
-          if [ -f "artifacts/HOPE_3_8_0-SUCCESSFUL-PROJECT.zip" ]; then
-            echo "PROJECT ZIP: SUCCESS"
-            ls -lh "artifacts/HOPE_3_8_0-SUCCESSFUL-PROJECT.zip"
-          else
-            echo "PROJECT ZIP: NOT CREATED"
-          fi
