@@ -1,0 +1,398 @@
+name: HOPE Diagnostic Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_ZIP: HOPE-3_8_0-GITHUB-ZIP-AUTO-BUILD-READY-V5-SELF-HEALING.zip
+  FLUTTER_VERSION: 3.47.0
+  JAVA_VERSION: '17'
+  BUILD_PROFILE: pilot
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f "$SOURCE_ZIP"
+
+          echo "SOURCE_ZIP=$SOURCE_ZIP"
+          ls -lh "$SOURCE_ZIP"
+
+      - name: Verify ZIP integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          unzip -t "$SOURCE_ZIP"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Flutter doctor
+        shell: bash
+        run: |
+          flutter doctor -v
+
+      - name: Extract project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf .hope-project
+          mkdir -p .hope-project
+
+          unzip -q "$SOURCE_ZIP" -d .hope-project
+
+          PROJECT_ROOT="$(
+            find .hope-project \
+              -name pubspec.yaml \
+              -type f \
+              -print \
+              -quit |
+              xargs -r dirname
+          )"
+
+          test -n "$PROJECT_ROOT"
+
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+
+          echo "Project root:"
+          echo "$PROJECT_ROOT"
+
+          echo
+          echo "Android files:"
+          find "$PROJECT_ROOT/android" \
+            -maxdepth 3 \
+            -type f |
+            sort |
+            head -200
+
+      - name: Validate project structure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f "$PROJECT_ROOT/pubspec.yaml"
+          test -d "$PROJECT_ROOT/android"
+          test -f "$PROJECT_ROOT/android/gradlew"
+
+          chmod +x "$PROJECT_ROOT/android/gradlew"
+
+          echo
+          echo "Relevant pubspec entries:"
+          grep -nE \
+            '^(name:|version:)|integration_test|flutter:' \
+            "$PROJECT_ROOT/pubspec.yaml" || true
+
+      - name: Flutter pub get
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          flutter pub get
+
+      - name: Capture plugin generation state
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set +e
+
+          echo "========================================"
+          echo "PUBSPEC integration_test"
+          echo "========================================"
+
+          grep -n -C 5 \
+            "integration_test" \
+            pubspec.yaml || true
+
+          echo
+          echo "========================================"
+          echo "GeneratedPluginRegistrant.java"
+          echo "========================================"
+
+          find android \
+            -name GeneratedPluginRegistrant.java \
+            -print \
+            -exec sed -n '1,260p' {} \; \
+            || true
+
+          echo
+          echo "========================================"
+          echo "IntegrationTestPlugin references"
+          echo "========================================"
+
+          grep -Rni \
+            "IntegrationTestPlugin\|integration_test" \
+            android/.flutter-plugins-dependencies \
+            .flutter-plugins-dependencies \
+            2>/dev/null \
+            || true
+
+          echo
+          echo "========================================"
+          echo "Flutter plugin dependencies"
+          echo "========================================"
+
+          find . \
+            -maxdepth 2 \
+            -name ".flutter-plugins-dependencies" \
+            -print \
+            -exec sed -n '1,300p' {} \; \
+            || true
+
+      - name: Flutter analyze
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set +e
+
+          flutter analyze 2>&1 |
+            tee "$GITHUB_WORKSPACE/analyze.log"
+
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          echo "ANALYZE_EXIT=$EXIT_CODE" >> "$GITHUB_ENV"
+
+          exit 0
+
+      - name: Dart format check
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set +e
+
+          dart format \
+            --output=none \
+            --set-exit-if-changed \
+            lib test 2>&1 |
+            tee "$GITHUB_WORKSPACE/format.log"
+
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          echo "FORMAT_EXIT=$EXIT_CODE" >> "$GITHUB_ENV"
+
+          exit 0
+
+      - name: Flutter tests
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set +e
+
+          flutter test --no-pub 2>&1 |
+            tee "$GITHUB_WORKSPACE/flutter-test.log"
+
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          echo "FLUTTER_TEST_EXIT=$EXIT_CODE" >> "$GITHUB_ENV"
+
+          exit 0
+
+      - name: Debug APK probe
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set +e
+
+          flutter build apk \
+            --debug \
+            --no-pub 2>&1 |
+            tee "$GITHUB_WORKSPACE/debug-build.log"
+
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          echo "DEBUG_BUILD_EXIT=$EXIT_CODE" >> "$GITHUB_ENV"
+
+          exit 0
+
+      - name: Gradle task probe
+        working-directory: ${{ env.PROJECT_ROOT }}/android
+        shell: bash
+        run: |
+          set +e
+
+          chmod +x gradlew
+
+          ./gradlew \
+            :app:tasks \
+            --all \
+            --no-daemon \
+            --stacktrace \
+            --info \
+            --console=plain 2>&1 |
+            tee "$GITHUB_WORKSPACE/gradle-tasks.log"
+
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          echo "GRADLE_TASKS_EXIT=$EXIT_CODE" >> "$GITHUB_ENV"
+
+          exit 0
+
+      - name: Gradle release dependency probe
+        working-directory: ${{ env.PROJECT_ROOT }}/android
+        shell: bash
+        run: |
+          set +e
+
+          ./gradlew \
+            :app:dependencies \
+            --configuration releaseRuntimeClasspath \
+            --no-daemon \
+            --stacktrace \
+            --info \
+            --console=plain 2>&1 |
+            tee "$GITHUB_WORKSPACE/gradle-dependencies.log"
+
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          echo "GRADLE_DEPS_EXIT=$EXIT_CODE" >> "$GITHUB_ENV"
+
+          exit 0
+
+      - name: Direct Gradle release build probe
+        working-directory: ${{ env.PROJECT_ROOT }}/android
+        shell: bash
+        run: |
+          set +e
+
+          ./gradlew \
+            :app:assembleRelease \
+            --no-daemon \
+            --stacktrace \
+            --info \
+            --console=plain 2>&1 |
+            tee "$GITHUB_WORKSPACE/gradle-release.log"
+
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          echo "GRADLE_RELEASE_EXIT=$EXIT_CODE" >> "$GITHUB_ENV"
+
+          exit 0
+
+      - name: Flutter release verbose probe
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set +e
+
+          flutter build apk \
+            --release \
+            --no-pub \
+            --verbose 2>&1 |
+            tee "$GITHUB_WORKSPACE/flutter-release-verbose.log"
+
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          echo "FLUTTER_RELEASE_EXIT=$EXIT_CODE" >> "$GITHUB_ENV"
+
+          exit 0
+
+      - name: Collect APKs and diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          echo "========================================" |
+            tee diagnostics-summary.txt
+
+          echo "EXIT STATUS" |
+            tee -a diagnostics-summary.txt
+
+          env |
+            grep -E \
+              '^(ANALYZE|FORMAT|FLUTTER_TEST|DEBUG_BUILD|GRADLE_TASKS|GRADLE_DEPS|GRADLE_RELEASE|FLUTTER_RELEASE)_EXIT=' |
+            sort |
+            tee -a diagnostics-summary.txt
+
+          echo |
+            tee -a diagnostics-summary.txt
+
+          echo "========================================" |
+            tee -a diagnostics-summary.txt
+
+          echo "APK FILES" |
+            tee -a diagnostics-summary.txt
+
+          find .hope-project \
+            -type f \
+            -name "*.apk" \
+            -printf "%p %s bytes\n" \
+            2>/dev/null |
+            tee -a diagnostics-summary.txt
+
+          echo |
+            tee -a diagnostics-summary.txt
+
+          echo "========================================" |
+            tee -a diagnostics-summary.txt
+
+          echo "IMPORTANT GRADLE ERRORS" |
+            tee -a diagnostics-summary.txt
+
+          grep -RniE \
+            "FAILURE:|What went wrong:|Execution failed|Caused by:|Could not resolve|Could not find|error:|Exception" \
+            .hope-project \
+            2>/dev/null |
+            tail -300 |
+            tee -a diagnostics-summary.txt \
+            || true
+
+          echo |
+            tee -a diagnostics-summary.txt
+
+          echo "========================================" |
+            tee -a diagnostics-summary.txt
+
+          echo "GENERATED PLUGIN REGISTRANT" |
+            tee -a diagnostics-summary.txt
+
+          find .hope-project \
+            -name GeneratedPluginRegistrant.java \
+            -print \
+            -exec grep -nE \
+              "IntegrationTestPlugin|integration_test|flutterEngine.getPlugins" \
+              {} \; \
+            2>/dev/null |
+            tee -a diagnostics-summary.txt \
+            || true
+
+      - name: Upload diagnostic bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hope-diagnostic-probe-${{ github.run_id }}
+          path: |
+            *.log
+            diagnostics-summary.txt
+            .hope-project/**/build/**/outputs/**/*.apk
+            .hope-project/**/GeneratedPluginRegistrant.java
+            .hope-project/**/.flutter-plugins-dependencies
+            .hope-project/**/pubspec.lock
+            .hope-project/**/android/build/reports/**
+          if-no-files-found: warn
+          retention-days: 14
