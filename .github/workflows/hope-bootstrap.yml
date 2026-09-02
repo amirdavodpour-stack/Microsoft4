@@ -92,12 +92,14 @@ jobs:
 
           else
 
-            SOURCE="$(find . \
-              -maxdepth 3 \
-              -type f \
-              -iname '*.zip' \
-              -print \
-              | head -n 1 || true)"
+            SOURCE="$(
+              find . \
+                -maxdepth 3 \
+                -type f \
+                -iname '*.zip' \
+                -print \
+                | head -n 1 || true
+            )"
 
           fi
 
@@ -144,7 +146,7 @@ jobs:
       # 5. JAVA
       # ============================================================
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
@@ -259,6 +261,7 @@ jobs:
           test -f pubspec.yaml
           test -d android
           test -d lib
+          test -x android/gradlew
 
           echo "Flutter project structure is valid."
 
@@ -306,6 +309,9 @@ jobs:
       - name: Align Gradle wrapper
         shell: bash
         working-directory: .hope-project
+        env:
+          TARGET_GRADLE_VERSION: ${{ env.GRADLE_VERSION }}
+          TARGET_GRADLE_SHA256: ${{ env.GRADLE_SHA256 }}
         run: |
           set -euo pipefail
 
@@ -318,29 +324,51 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
+          import os
 
           path = Path("android/gradle/wrapper/gradle-wrapper.properties")
 
-          version = "8.14.3"
+          version = os.environ["TARGET_GRADLE_VERSION"]
+          sha256 = os.environ["TARGET_GRADLE_SHA256"]
 
           distribution_url = (
               "https://services.gradle.org/distributions/"
-              f"gradle-{version}-all.zip"
+              f"gradle-{version}-bin.zip"
           )
 
           lines = path.read_text().splitlines()
 
-          replaced = False
+          values = {
+              "distributionUrl": distribution_url,
+              "distributionSha256Sum": sha256,
+              "networkTimeout": "10000",
+              "validateDistributionUrl": "true",
+          }
 
-          for i, line in enumerate(lines):
-              if line.startswith("distributionUrl="):
-                  lines[i] = "distributionUrl=" + distribution_url
-                  replaced = True
+          found = set()
 
-          if not replaced:
-              lines.append("distributionUrl=" + distribution_url)
+          output = []
 
-          path.write_text("\n".join(lines) + "\n")
+          for line in lines:
+              replaced = False
+
+              for key, value in values.items():
+                  prefix = key + "="
+
+                  if line.startswith(prefix):
+                      output.append(prefix + value)
+                      found.add(key)
+                      replaced = True
+                      break
+
+              if not replaced:
+                  output.append(line)
+
+          for key, value in values.items():
+              if key not in found:
+                  output.append(f"{key}={value}")
+
+          path.write_text("\n".join(output) + "\n")
 
           print("=== FINAL GRADLE WRAPPER ===")
           print(path.read_text())
@@ -432,10 +460,6 @@ jobs:
             mkdir -p "$ATTEMPT_ROOT"
             mkdir -p "$GRADLE_HOME"
 
-            # ------------------------------------------------------
-            # Completely fresh project for every attempt.
-            # ------------------------------------------------------
-
             cp -a \
               "$GITHUB_WORKSPACE/.hope-project"/. \
               "$ATTEMPT_ROOT"/
@@ -470,6 +494,10 @@ jobs:
             echo "Stopping Gradle..."
 
             ./android/gradlew --stop || true
+
+            echo
+            echo "Gradle wrapper configuration:"
+            cat android/gradle/wrapper/gradle-wrapper.properties
 
             echo
             echo "Flutter version:"
@@ -601,6 +629,10 @@ jobs:
             echo
             echo "=== JAVA PROCESSES ==="
             ps aux | grep -i java | grep -v grep || true
+
+            echo
+            echo "=== GRADLE WRAPPER ==="
+            cat android/gradle/wrapper/gradle-wrapper.properties || true
 
             echo
             echo "Stopping Gradle..."
@@ -763,6 +795,11 @@ jobs:
           ps aux \
             > artifacts/diagnostics/processes.txt \
             2>&1
+
+          if [[ -f .hope-project/android/gradle/wrapper/gradle-wrapper.properties ]]; then
+            cat .hope-project/android/gradle/wrapper/gradle-wrapper.properties \
+              > artifacts/diagnostics/gradle-wrapper.txt
+          fi
 
           find "$GITHUB_WORKSPACE" \
             -maxdepth 4 \
