@@ -18,9 +18,12 @@ RUN set -eux; \
     test -f /app/src/db/schema.js; \
     echo "Patching notification_preferences schema..."; \
     sed -i 's/marketing BOOLEAN NOT NULL DEFAULT FALSE, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()/marketing BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()/' /app/src/db/schema.js; \
-    echo "Verifying schema patch..."; \
-    grep -n -A6 -B2 "CREATE TABLE IF NOT EXISTS notification_preferences" /app/src/db/schema.js; \
-    echo "Schema patch completed."
+    echo "Injecting live PostgreSQL migration..."; \
+    sed -i '/marketing BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()/a\
+    ALTER TABLE notification_preferences ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();' /app/src/db/schema.js; \
+    echo "Verifying patch..."; \
+    grep -n -A8 -B3 "notification_preferences" /app/src/db/schema.js; \
+    echo "Patch completed."
 
 WORKDIR /app
 
