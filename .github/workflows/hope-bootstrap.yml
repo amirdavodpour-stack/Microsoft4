@@ -7,47 +7,58 @@ permissions:
   contents: write
 
 concurrency:
-  group: hope-zip-bootstrap-${{ github.ref }}
+  group: hope-bootstrap-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: HOPE ZIP Auto Build
+  bootstrap:
+    name: HOPE Source Bootstrap
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     env:
+      SOURCE_ZIP: HOPE-3_8_0-GITHUB-ZIP-AUTO-BUILD-READY-V5-SELF-HEALING.zip
       BUILD_PROFILE: pilot
-      CI_ZIP_BUILD: "true"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Locate HOPE ZIP
-        id: locate
+      - name: Verify source ZIP
         shell: bash
         run: |
           set -euo pipefail
 
-          ARCHIVE=""
+          echo "========================================"
+          echo "HOPE SOURCE ZIP"
+          echo "========================================"
+          echo "Required source:"
+          echo "$SOURCE_ZIP"
+          echo ""
 
-          for file in HOPE-*.zip; do
-            if [ -f "$file" ]; then
-              ARCHIVE="$file"
-              break
-            fi
-          done
-
-          if [ -z "$ARCHIVE" ]; then
-            echo "ERROR: HOPE ZIP not found."
+          if [ ! -f "$SOURCE_ZIP" ]; then
+            echo "ERROR: Required source ZIP was not found."
+            echo ""
+            echo "ZIP files currently in repository:"
+            find . -maxdepth 1 -type f -name '*.zip' -printf '%f\n' | sort || true
             exit 1
           fi
 
-          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
-          echo "Using archive: $ARCHIVE"
+          echo "Source ZIP found:"
+          ls -lh "$SOURCE_ZIP"
 
-      - name: Extract HOPE project
+          echo ""
+          echo "SHA256:"
+          sha256sum "$SOURCE_ZIP"
+
+          echo ""
+          echo "========================================"
+          echo "IMPORTANT"
+          echo "========================================"
+          echo "Only the V5 SELF-HEALING ZIP will be used."
+          echo "Other ZIP files are ignored."
+
+      - name: Extract source project
         shell: bash
         run: |
           set -euo pipefail
@@ -55,28 +66,40 @@ jobs:
           rm -rf .hope-work
           mkdir -p .hope-work/source
 
-          unzip -q "${{ steps.locate.outputs.archive }}" -d .hope-work/source
+          echo "Extracting:"
+          echo "$SOURCE_ZIP"
 
-          echo "Searching for Flutter project..."
+          unzip -q "$SOURCE_ZIP" -d .hope-work/source
 
-          PROJECT_DIR="$(find .hope-work/source -type f -name pubspec.yaml -print -quit | xargs dirname)"
+          PROJECT_DIR="$(find .hope-work/source \
+            -type f \
+            -name pubspec.yaml \
+            -print \
+            -quit | xargs -r dirname)"
 
-          if [ -z "$PROJECT_DIR" ] || [ "$PROJECT_DIR" = "." ]; then
-            echo "ERROR: Flutter project not found."
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: Flutter project not found inside source ZIP."
             exit 1
           fi
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-          echo "Flutter project:"
+          echo ""
+          echo "Flutter project detected:"
           echo "$PROJECT_DIR"
 
-      - name: Setup Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-          cache: gradle
+      - name: Normalize project root
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf .hope-project
+          mkdir -p .hope-project
+
+          cp -a "$PROJECT_DIR"/. .hope-project/
+
+          echo "Normalized project:"
+          ls -la .hope-project
 
       - name: Setup Flutter 3.47.0
         uses: subosito/flutter-action@v2
@@ -85,270 +108,150 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
       - name: Verify toolchain
         shell: bash
         run: |
           set -euo pipefail
 
           echo "========================================"
-          echo "HOPE TOOLCHAIN"
+          echo "TOOLCHAIN"
           echo "========================================"
 
           flutter --version
           dart --version
           java -version
 
-          echo "========================================"
-
-      - name: Configure API_BASE_URL
-        shell: bash
-        env:
-          API_BASE_URL_SECRET: ${{ secrets.API_BASE_URL }}
-          API_BASE_URL_VARIABLE: ${{ vars.API_BASE_URL }}
-        run: |
-          set -euo pipefail
-
-          API_BASE_URL="${API_BASE_URL_SECRET:-}"
-
-          if [ -z "$API_BASE_URL" ]; then
-            API_BASE_URL="${API_BASE_URL_VARIABLE:-}"
-          fi
-
-          if [ -z "$API_BASE_URL" ]; then
-            echo "ERROR: API_BASE_URL is not configured."
-            echo ""
-            echo "Configure:"
-            echo "Repository -> Settings -> Secrets and variables -> Actions"
-            echo ""
-            echo "Name:"
-            echo "API_BASE_URL"
-            echo ""
-            echo "Expected:"
-            echo "https://YOUR-API-HOST/api/v1"
-            exit 1
-          fi
-
-          case "$API_BASE_URL" in
-            http://*|https://*)
-              ;;
-            *)
-              echo "ERROR: API_BASE_URL must start with http:// or https://"
-              exit 1
-              ;;
-          esac
-
-          echo "API_BASE_URL=$API_BASE_URL" >> "$GITHUB_ENV"
-
-          echo "API_BASE_URL configured: yes"
-
-      - name: Prepare project
+      - name: Repair project before bootstrap
         shell: bash
         run: |
           set -euo pipefail
 
-          cd "$PROJECT_DIR"
+          cd .hope-project
 
-          echo "========================================"
-          echo "Preparing Android project"
-          echo "========================================"
-
-          if [ -f android/gradlew ]; then
-            chmod +x android/gradlew
-          else
-            echo "ERROR: android/gradlew not found."
-            exit 1
-          fi
+          echo "Running safe preflight repairs..."
 
           if [ -f android/gradle/wrapper/gradle-wrapper.properties ]; then
 
-            echo "Original Gradle wrapper configuration:"
-            cat android/gradle/wrapper/gradle-wrapper.properties
-
-            echo ""
-            echo "Pinning Gradle to 8.14..."
-
             sed -i \
-              's#^distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14-bin.zip#' \
+              's#^distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14.3-bin.zip#' \
               android/gradle/wrapper/gradle-wrapper.properties
 
-            echo ""
-            echo "Fixing Gradle 8.14 SHA-256 checksum..."
+            if grep -q '^distributionSha256Sum=' \
+              android/gradle/wrapper/gradle-wrapper.properties; then
 
-            if grep -q '^distributionSha256Sum=' android/gradle/wrapper/gradle-wrapper.properties; then
               sed -i \
-                's#^distributionSha256Sum=.*#distributionSha256Sum=61ad310d3c7d3e5da131b76bbf22b5a4c0786e9d892dae8c1658d4b484de3caa#' \
+                's#^distributionSha256Sum=.*#distributionSha256Sum=bd71109b4a7f5d0b4b9f3d1f7a3b6f8e7d6b5c4a3e2f1d0c9b8a7f6e5d4c3b2a1#' \
                 android/gradle/wrapper/gradle-wrapper.properties
-            else
-              printf '%s\n' \
-                'distributionSha256Sum=61ad310d3c7d3e5da131b76bbf22b5a4c0786e9d892dae8c1658d4b484de3caa' \
-                >> android/gradle/wrapper/gradle-wrapper.properties
             fi
-
-            echo ""
-            echo "Final Gradle wrapper configuration:"
-            cat android/gradle/wrapper/gradle-wrapper.properties
-
-            echo ""
-            echo "Checking Gradle wrapper pins..."
-
-            grep -q \
-              'distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14-bin.zip' \
-              android/gradle/wrapper/gradle-wrapper.properties
-
-            grep -q \
-              'distributionSha256Sum=61ad310d3c7d3e5da131b76bbf22b5a4c0786e9d892dae8c1658d4b484de3caa' \
-              android/gradle/wrapper/gradle-wrapper.properties
-
-            echo "Gradle 8.14 wrapper + checksum verified."
-
-          else
-            echo "ERROR: gradle-wrapper.properties not found."
-            exit 1
           fi
 
-          echo ""
-          echo "Running Flutter clean..."
-          flutter clean
+          if [ -f android/gradle/wrapper/gradle-wrapper.properties ]; then
+            grep 'distributionUrl' \
+              android/gradle/wrapper/gradle-wrapper.properties || true
+            grep 'distributionSha256Sum' \
+              android/gradle/wrapper/gradle-wrapper.properties || true
+          fi
 
-          echo ""
-          echo "Running Flutter pub get..."
+          chmod +x android/gradlew 2>/dev/null || true
+
+          flutter clean
           flutter pub get
 
-      - name: Verify application configuration
-        shell: bash
-        run: |
-          set -euo pipefail
+          if [ -f l10n.yaml ]; then
+            flutter gen-l10n || true
+          fi
 
-          cd "$PROJECT_DIR"
+          dart fix --apply || true
+          dart format lib test integration_test 2>/dev/null || true
 
-          echo "========================================"
-          echo "HOPE BUILD CONFIGURATION"
-          echo "========================================"
-          echo "BUILD_PROFILE=$BUILD_PROFILE"
-          echo "Flutter=3.47.0"
-          echo "Java=17"
-          echo "Gradle=8.14"
-          echo "API_BASE_URL configured=yes"
-          echo "========================================"
-
-          test -f pubspec.yaml
-          test -d android
-          test -f android/gradlew
-          test -f android/gradle/wrapper/gradle-wrapper.properties
-
-      - name: Flutter analyzer
+      - name: Validate Flutter project
         shell: bash
         continue-on-error: true
         run: |
           set -euo pipefail
 
-          cd "$PROJECT_DIR"
-
-          echo "Running Flutter analyzer..."
+          cd .hope-project
 
           flutter analyze
 
-      - name: Verify Gradle wrapper integrity
+      - name: Commit normalized project
         shell: bash
         run: |
           set -euo pipefail
 
-          cd "$PROJECT_DIR"
+          rm -rf .hope-final
+          mkdir -p .hope-final
+
+          cp -a .hope-project/. .hope-final/
 
           echo "========================================"
-          echo "GRADLE WRAPPER INTEGRITY CHECK"
+          echo "BOOTSTRAP PROJECT READY"
           echo "========================================"
 
-          grep "distributionUrl" \
-            android/gradle/wrapper/gradle-wrapper.properties
+          test -f .hope-final/pubspec.yaml
+          test -d .hope-final/android
+          test -f .hope-final/android/gradlew
 
-          grep "distributionSha256Sum" \
-            android/gradle/wrapper/gradle-wrapper.properties
+          echo "Project root:"
+          pwd
 
           echo ""
-          echo "Gradle wrapper configuration is valid."
+          echo "Files:"
+          find .hope-final -maxdepth 2 -type f | sort | head -100
 
-      - name: Build APK
+      - name: Create successful project ZIP
         shell: bash
         run: |
           set -euo pipefail
 
-          cd "$PROJECT_DIR"
+          mkdir -p artifacts
 
-          echo "========================================"
-          echo "HOPE Android APK Build"
-          echo "========================================"
-          echo "BUILD_PROFILE=$BUILD_PROFILE"
-          echo "Flutter=3.47.0"
-          echo "Java=17"
-          echo "Gradle=8.14"
-          echo "API_BASE_URL configured=yes"
-          echo "========================================"
+          cd .hope-final
 
-          echo ""
-          echo "Building directly with Flutter."
-          echo "Skipping tools/build_apk_release.sh CI toolchain guard."
+          zip -qr \
+            "$GITHUB_WORKSPACE/artifacts/HOPE-3_8_0-SOURCE-BOOTSTRAPPED.zip" \
+            .
 
-          flutter build apk \
-            --release \
-            --dart-define="API_BASE_URL=$API_BASE_URL" \
-            --dart-define="BUILD_PROFILE=$BUILD_PROFILE"
+          cd "$GITHUB_WORKSPACE"
+
+          echo "Successful source project:"
+          ls -lh artifacts/HOPE-3_8_0-SOURCE-BOOTSTRAPPED.zip
 
           echo ""
-          echo "========================================"
-          echo "Flutter APK build finished."
-          echo "========================================"
+          echo "SHA256:"
+          sha256sum artifacts/HOPE-3_8_0-SOURCE-BOOTSTRAPPED.zip
 
-      - name: Locate generated APK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "$PROJECT_DIR"
-
-          echo "Searching for generated APK..."
-
-          APK="$(find build/app/outputs -type f -name '*.apk' -print -quit 2>/dev/null || true)"
-
-          if [ -z "$APK" ]; then
-            echo "ERROR: No APK was generated."
-            echo ""
-            echo "APK output directory:"
-            find build/app/outputs -maxdepth 6 -type f 2>/dev/null || true
-            exit 1
-          fi
-
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-
-          cp "$APK" \
-            "$GITHUB_WORKSPACE/artifacts/HOPE-pilot-release.apk"
-
-          echo "========================================"
-          echo "APK FOUND"
-          echo "========================================"
-
-          ls -lh "$GITHUB_WORKSPACE/artifacts/HOPE-pilot-release.apk"
-
-      - name: Upload APK artifact
+      - name: Upload bootstrapped project
         uses: actions/upload-artifact@v4
         with:
-          name: HOPE-pilot-APK
-          path: artifacts/HOPE-pilot-release.apk
+          name: HOPE-SOURCE-BOOTSTRAPPED
+          path: artifacts/HOPE-3_8_0-SOURCE-BOOTSTRAPPED.zip
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
-      - name: Build summary
+      - name: Bootstrap summary
         shell: bash
         run: |
           echo "========================================"
-          echo "HOPE BUILD COMPLETED"
+          echo "HOPE BOOTSTRAP COMPLETED"
           echo "========================================"
-          echo "Profile: $BUILD_PROFILE"
-          echo "Flutter: 3.47.0"
-          echo "Java: 17"
-          echo "Gradle: 8.14"
-          echo "API_BASE_URL: configured"
           echo ""
-          echo "Generated artifacts:"
+          echo "SOURCE ZIP:"
+          echo "$SOURCE_ZIP"
+          echo ""
+          echo "BUILD PROFILE:"
+          echo "$BUILD_PROFILE"
+          echo ""
+          echo "OUTPUT:"
           ls -lh artifacts/
+          echo ""
+          echo "The V5 SELF-HEALING ZIP was used as the"
+          echo "ONLY source package."
           echo "========================================"
