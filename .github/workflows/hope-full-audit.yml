@@ -1,0 +1,647 @@
+name: HOPE — Full Environment-Aware Audit
+
+on:
+workflow_dispatch:
+inputs:
+source_zip:
+description: "EXACT source ZIP filename in repository root (required; e.g. HOPE-3_8_0-build-ready-V6-CI-RELEASE-GATE.zip)"
+required: true
+type: string
+run_staging_device:
+description: "Run HTTPS staging emulator certification when STAGING_API_BASE_URL is configured"
+required: false
+default: true
+type: boolean
+
+permissions:
+contents: read
+actions: read
+
+concurrency:
+group: hope-full-audit-${{ github.workflow }}-${{ github.ref }}
+cancel-in-progress: false
+
+env:
+SOURCE_ZIP: ${{ inputs.source_zip }}
+FLUTTER_VERSION: "3.47.0"
+NODE_VERSION: "24.x"
+JAVA_VERSION: "17"
+
+jobs:
+backend-static:
+name: Backend — static + complete Node suite
+runs-on: ubuntu-24.04
+steps:
+- uses: actions/checkout@v5
+
+  - name: Prepare exact source ZIP
+    run: |
+      tools/ci/prepare_source_zip.sh "$SOURCE_ZIP" "$RUNNER_TEMP/prepared"
+      mkdir -p audit/jobs/backend-static
+      cp "$RUNNER_TEMP/prepared/project-root.txt" audit/jobs/backend-static/project-root.txt
+
+  - uses: actions/setup-node@v6
+    with:
+      node-version: ${{ env.NODE_VERSION }}
+
+  - name: Install backend dependencies
+    run: |
+      ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
+      cd "$ROOT/backend"
+      npm ci
+
+  - name: Capture environment
+    run: |
+      ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
+      mkdir -p audit/jobs/backend-static/cases
+      {
+        node --version
+        npm --version
+        uname -a
+        git --version
+      } > audit/jobs/backend-static/environment.txt
+
+  - name: Backend checks and full test suite
+    run: |
+      ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
+      export AUDIT_OUT_DIR="$PWD/audit/jobs/backend-static"
+      cd "$ROOT/backend"
+
+      "$OLDPWD/tools/ci/run_case.sh" backend_check npm run check
+      "$OLDPWD/tools/ci/run_case.sh" backend_all_tests npm test
+      "$OLDPWD/tools/ci/run_case.sh" backend_e2e npm run test:e2e
+      "$OLDPWD/tools/ci/run_case.sh" backend_product npm run test:product
+      "$OLDPWD/tools/ci/run_case.sh" backend_security npm run test:wave10
+      "$OLDPWD/tools/ci/run_case.sh" backend_perf_contract npm run test:perf
+      "$OLDPWD/tools/ci/run_case.sh" backend_score npm run score:90plus
+      "$OLDPWD/tools/ci/run_case.sh" backend_security_audit npm audit --audit-level=high
+      "$OLDPWD/tools/ci/run_case.sh" backend_sbom npm run sbom
+      "$OLDPWD/tools/ci/run_case.sh" backend_release_evidence npm run test:release-evidence
+
+  - name: Upload backend evidence
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: hope-audit-backend-static-${{ github.run_id }}
+      path: audit/jobs/backend-static
+      if-no-files-found: error
+
+backend-system:
+name: Backend — PostgreSQL + S3 + backup/restore + failure injection
+runs-on: ubuntu-24.04
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    env:
+      POSTGRES_DB: hope
+      POSTGRES_USER: hope
+      POSTGRES_PASSWORD: hope
+    ports:
+      - "5432:5432"
+    options: >-
+      --health-cmd "pg_isready -U hope -d hope"
+      --health-interval 5s
+      --health-timeout 5s
+      --health-retries 20
+
+steps:
+  - uses: actions/checkout@v5
+
+  - name: Prepare exact source ZIP
+    run: |
+      tools/ci/prepare_source_zip.sh "$SOURCE_ZIP" "$RUNNER_TEMP/prepared"
+
+  - uses: actions/setup-node@v6
+    with:
+      node-version: ${{ env.NODE_VERSION }}
+
+  - name: Install PostgreSQL client + start MinIO
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y postgresql-client
+
+      docker run -d \
+        --name hope-minio \
+        -p 9000:9000 \
+        -p 9001:9001 \
+        -e MINIO_ROOT_USER=minioadmin \
+        -e MINIO_ROOT_PASSWORD=minioadmin \
+        quay.io/minio/minio:latest \
+        server /data \
+        --console-address :9001
+
+      for i in {1..30}; do
+        curl -fsS http://127.0.0.1:9000/minio/health/live && break
+        sleep 2
+      done
+
+  - name: Run DB-backed and resilience tests
+    run: |
+      ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
+      cd "$ROOT/backend"
+
+      npm ci
+
+      DATA_FILE="$RUNNER_TEMP/hope-db-seed.json" \
+      STORAGE_DIR="$RUNNER_TEMP/hope-db-storage" \
+      npm run migrate
+
+      DATA_FILE="$RUNNER_TEMP/hope-db-seed.json" \
+      STORAGE_DIR="$RUNNER_TEMP/hope-db-storage" \
+      npm run seed
+
+      mkdir -p "$OLDPWD/audit/jobs/backend-system/cases"
+      export AUDIT_OUT_DIR="$OLDPWD/audit/jobs/backend-system"
+
+      export DATABASE_URL='postgres://hope:hope@127.0.0.1:5432/hope'
+      export DATA_FILE="$RUNNER_TEMP/hope.json"
+      export STORAGE_DIR="$RUNNER_TEMP/hope-storage"
+
+      export S3_INTEGRATION=1
+      export S3_BUCKET=hope-ci
+      export S3_REGION=us-east-1
+      export S3_ENDPOINT=http://127.0.0.1:9000
+      export S3_FORCE_PATH_STYLE=true
+      export AWS_ACCESS_KEY_ID=minioadmin
+      export AWS_SECRET_ACCESS_KEY=minioadmin
+
+      "$OLDPWD/tools/ci/run_case.sh" postgres_integration npm run test:postgres
+      "$OLDPWD/tools/ci/run_case.sh" s3_integration npm run test:s3
+      "$OLDPWD/tools/ci/run_case.sh" e2e_database npm run test:e2e
+      "$OLDPWD/tools/ci/run_case.sh" failure_injection npm run test:failure-injection
+      "$OLDPWD/tools/ci/run_case.sh" backup_contract npm run test:backup
+      "$OLDPWD/tools/ci/run_case.sh" backup_script bash -c 'BACKUP_DIR="$RUNNER_TEMP/backups" ./scripts/backup.sh'
+
+      BACKUP_FILE="$(find "$RUNNER_TEMP/backups" -type f -name 'hope-*.dump' | head -1)"
+
+      if [[ -n "$BACKUP_FILE" ]]; then
+        "$OLDPWD/tools/ci/run_case.sh" \
+          backup_verify \
+          bash -c './scripts/verify-backup.sh "$1"' \
+          _ \
+          "$BACKUP_FILE"
+      else
+        mkdir -p "$AUDIT_OUT_DIR/cases/backup_verify"
+        printf '1\n' > "$AUDIT_OUT_DIR/cases/backup_verify/status.txt"
+        printf 'backup dump was not produced\n' \
+          > "$AUDIT_OUT_DIR/cases/backup_verify/run.log"
+      fi
+
+  - name: Isolated DR restore drill
+    run: |
+      ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
+
+      export AUDIT_OUT_DIR="$PWD/audit/jobs/backend-system"
+      export SOURCE_DATABASE_URL='postgres://hope:hope@127.0.0.1:5432/hope'
+
+      docker run -d \
+        --name hope-dr-postgres \
+        -e POSTGRES_DB=hope_dr \
+        -e POSTGRES_USER=hope \
+        -e POSTGRES_PASSWORD=hope \
+        -p 127.0.0.1:55432:5432 \
+        postgres:16-alpine
+
+      until pg_isready \
+        -h 127.0.0.1 \
+        -p 55432 \
+        -U hope \
+        -d hope_dr; do
+        sleep 2
+      done
+
+      cd "$ROOT/backend"
+
+      DRILL_EVIDENCE_FILE="$AUDIT_OUT_DIR/dr-restore-evidence.txt" \
+      DRILL_DATABASE_URL='postgres://hope:hope@127.0.0.1:55432/hope_dr' \
+      bash scripts/dr-restore-drill.sh
+
+      mkdir -p "$AUDIT_OUT_DIR/cases/dr_restore"
+
+      printf '0\n' \
+        > "$AUDIT_OUT_DIR/cases/dr_restore/status.txt"
+
+      cp \
+        "$AUDIT_OUT_DIR/dr-restore-evidence.txt" \
+        "$AUDIT_OUT_DIR/cases/dr_restore/run.log"
+
+  - name: Upload system evidence
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: hope-audit-backend-system-${{ github.run_id }}
+      path: audit/jobs/backend-system
+      if-no-files-found: error
+
+mobile-static:
+name: Mobile — format + analyze + unit/widget tests
+runs-on: ubuntu-24.04
+
+steps:
+  - uses: actions/checkout@v5
+
+  - name: Prepare exact source ZIP
+    run: |
+      tools/ci/prepare_source_zip.sh "$SOURCE_ZIP" "$RUNNER_TEMP/prepared"
+
+  - uses: subosito/flutter-action@v2
+    with:
+      flutter-version: ${{ env.FLUTTER_VERSION }}
+      channel: stable
+      cache: true
+
+  - name: Capture Flutter environment
+    run: |
+      flutter --version
+      dart --version
+
+  - name: Run mobile quality gates
+    run: |
+      ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
+
+      cd "$ROOT"
+
+      mkdir -p "$GITHUB_WORKSPACE/audit/jobs/mobile-static/cases"
+
+      export AUDIT_OUT_DIR="$GITHUB_WORKSPACE/audit/jobs/mobile-static"
+
+      "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
+        pub_get \
+        flutter pub get
+
+      "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
+        gen_l10n \
+        flutter gen-l10n
+
+      "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
+        format \
+        dart format --set-exit-if-changed .
+
+      "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
+        analyze \
+        flutter analyze
+
+      "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
+        unit_widget \
+        flutter test --no-pub
+
+      "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
+        localization \
+        bash tools/check_localization.sh
+
+      "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
+        ux_contract \
+        bash tools/check_ux_wave8.sh
+
+      "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
+        release_contract \
+        bash tools/android-release-contract.sh
+
+      "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
+        runtime_contract \
+        bash tools/android-runtime-cert-contract.sh
+
+  - name: Upload mobile static evidence
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: hope-audit-mobile-static-${{ github.run_id }}
+      path: audit/jobs/mobile-static
+      if-no-files-found: error
+
+android-emulator:
+name: Android — real emulator integration surface
+runs-on: ubuntu-24.04
+
+steps:
+  - uses: actions/checkout@v5
+
+  - name: Prepare exact source ZIP
+    run: |
+      tools/ci/prepare_source_zip.sh "$SOURCE_ZIP" "$RUNNER_TEMP/prepared"
+
+  - uses: subosito/flutter-action@v2
+    with:
+      flutter-version: ${{ env.FLUTTER_VERSION }}
+      channel: stable
+      cache: true
+
+  - uses: actions/setup-node@v6
+    with:
+      node-version: ${{ env.NODE_VERSION }}
+
+  - name: Prepare project dependencies and local API
+    run: |
+      ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
+
+      cd "$ROOT"
+
+      flutter pub get
+      flutter gen-l10n
+
+      cd backend
+
+      npm ci
+
+      DATA_FILE="$RUNNER_TEMP/device-hope.json" \
+      STORAGE_DIR="$RUNNER_TEMP/device-storage" \
+      npm run seed
+
+      HOST=0.0.0.0 \
+      PORT=3000 \
+      DATA_FILE="$RUNNER_TEMP/device-hope.json" \
+      STORAGE_DIR="$RUNNER_TEMP/device-storage" \
+      ACCESS_TOKEN_SECRET='ci-access-secret-012345678901234567890123' \
+      REFRESH_TOKEN_SECRET='ci-refresh-secret-012345678901234567890123' \
+      nohup npm start \
+        > "$RUNNER_TEMP/hope-api-device.log" 2>&1 &
+
+      echo $! > "$RUNNER_TEMP/hope-api-device.pid"
+
+      for i in {1..30}; do
+        curl -fsS http://127.0.0.1:3000/live >/dev/null && break
+        sleep 2
+      done
+
+      mkdir -p "$GITHUB_WORKSPACE/audit/jobs/android-emulator"
+
+      curl -fsS \
+        http://127.0.0.1:3000/live \
+        > "$GITHUB_WORKSPACE/audit-live-local-api.json"
+
+  - name: Run integration tests on Android Emulator
+    uses: reactivecircus/android-emulator-runner@v2
+    env:
+      SOURCE_PROJECT_ROOT: ${{ runner.temp }}/prepared
+    with:
+      api-level: 36
+      target: google_apis
+      arch: x86_64
+      profile: pixel_6
+      force-avd-creation: true
+      emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
+      disable-animations: true
+
+      script: |
+        set -Eeuo pipefail
+
+        ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
+
+        mkdir -p \
+          "$GITHUB_WORKSPACE/audit/jobs/android-emulator/cases/emulator_integration"
+
+        export AUDIT_OUT_DIR="$GITHUB_WORKSPACE/audit/jobs/android-emulator"
+
+        cd "$ROOT"
+
+        "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
+          emulator_smoke \
+          flutter test integration_test/app_smoke_test.dart \
+          --dart-define=API_BASE_URL=http://10.0.2.2:3000/api/v1 \
+          --dart-define=CI_DEVICE_INTEGRATION=false
+
+        "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
+          emulator_api_runtime \
+          flutter test integration_test/local_api_smoke_test.dart \
+          --dart-define=API_BASE_URL=http://10.0.2.2:3000/api/v1
+
+  - name: Upload Android evidence
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: hope-audit-android-emulator-${{ github.run_id }}
+      path: audit/jobs/android-emulator
+      if-no-files-found: error
+
+staging-device:
+name: Android — HTTPS staging runtime certification
+runs-on: ubuntu-24.04
+
+if: ${{ inputs.run_staging_device && vars.STAGING_API_BASE_URL != '' }}
+
+steps:
+  - uses: actions/checkout@v5
+
+  - name: Prepare exact source ZIP
+    run: |
+      tools/ci/prepare_source_zip.sh "$SOURCE_ZIP" "$RUNNER_TEMP/prepared"
+
+  - uses: subosito/flutter-action@v2
+    with:
+      flutter-version: ${{ env.FLUTTER_VERSION }}
+      channel: stable
+      cache: true
+
+  - name: Run HTTPS staging certification on Android Emulator
+    uses: reactivecircus/android-emulator-runner@v2
+    env:
+      STAGING_API_BASE_URL: ${{ vars.STAGING_API_BASE_URL }}
+    with:
+      api-level: 36
+      target: google_apis
+      arch: x86_64
+      profile: pixel_6
+      force-avd-creation: true
+      emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
+      disable-animations: true
+
+      script: |
+        set -Eeuo pipefail
+
+        ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
+
+        mkdir -p "$GITHUB_WORKSPACE/audit/jobs/staging-device/cases"
+
+        export AUDIT_OUT_DIR="$GITHUB_WORKSPACE/audit/jobs/staging-device"
+
+        cd "$ROOT"
+
+        flutter pub get
+        flutter gen-l10n
+
+        "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
+          staging_https \
+          flutter test integration_test/app_smoke_test.dart \
+          --dart-define=API_BASE_URL="$STAGING_API_BASE_URL" \
+          --dart-define=CI_DEVICE_INTEGRATION=true
+
+  - name: Upload staging device evidence
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: hope-audit-staging-device-${{ github.run_id }}
+      path: audit/jobs/staging-device
+      if-no-files-found: warn
+
+release-build:
+name: Release — isolated production/pilot build + APK verification
+runs-on: ubuntu-24.04
+
+steps:
+  - uses: actions/checkout@v5
+
+  - name: Prepare exact source ZIP
+    run: |
+      tools/ci/prepare_source_zip.sh "$SOURCE_ZIP" "$RUNNER_TEMP/prepared"
+
+  - uses: subosito/flutter-action@v2
+    with:
+      flutter-version: ${{ env.FLUTTER_VERSION }}
+      channel: stable
+      cache: true
+
+  - uses: actions/setup-java@v5
+    with:
+      distribution: temurin
+      java-version: ${{ env.JAVA_VERSION }}
+      cache: gradle
+
+  - name: Build isolated pilot APK and verify metadata/signature
+    env:
+      API_BASE_URL: ${{ vars.STAGING_API_BASE_URL || 'https://ci.example.invalid/api/v1' }}
+
+    run: |
+      ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
+
+      cd "$ROOT"
+
+      mkdir -p "$GITHUB_WORKSPACE/audit/jobs/release-build"
+
+      export AUDIT_OUT_DIR="$GITHUB_WORKSPACE/audit/jobs/release-build"
+
+      "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
+        release_contract \
+        bash tools/android-release-contract.sh
+
+      if [[ -x tools/build_release_isolated.sh ]]; then
+        "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
+          isolated_release \
+          bash tools/build_release_isolated.sh
+      else
+        "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
+          direct_release \
+          bash tools/build_apk_release.sh
+      fi
+
+      find "$ROOT" \
+        -type f \
+        \
+          -name '*.apk' \
+          -o -name 'SHA256SUMS.txt' \
+          -o -name 'VERIFICATION.txt' \
+        \
+        -print \
+        | sort \
+        > "$GITHUB_WORKSPACE/audit/jobs/release-build/artifacts-found.txt"
+
+      if [[ -d "$ROOT/artifacts" ]]; then
+        cp -a \
+          "$ROOT/artifacts" \
+          "$GITHUB_WORKSPACE/audit/jobs/release-build/"
+      fi
+
+  - name: Upload release evidence
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: hope-audit-release-build-${{ github.run_id }}
+      path: audit/jobs/release-build
+      if-no-files-found: warn
+
+aggregate:
+name: Aggregate — final hard audit gate
+runs-on: ubuntu-24.04
+
+needs:
+  - backend-static
+  - backend-system
+  - mobile-static
+  - android-emulator
+  - staging-device
+  - release-build
+
+if: always()
+
+steps:
+  - uses: actions/checkout@v5
+
+  - uses: actions/download-artifact@v5
+    with:
+      pattern: hope-audit-*-${{ github.run_id }}
+      merge-multiple: false
+
+  - name: Collect all evidence
+    run: |
+      mkdir -p audit/jobs
+
+      shopt -s nullglob
+
+      for d in hope-audit-*-${{ github.run_id }}; do
+
+        case "$d" in
+          hope-audit-backend-static-*)
+            job=backend-static
+            ;;
+
+          hope-audit-backend-system-*)
+            job=backend-system
+            ;;
+
+          hope-audit-mobile-static-*)
+            job=mobile-static
+            ;;
+
+          hope-audit-android-emulator-*)
+            job=android-emulator
+            ;;
+
+          hope-audit-staging-device-*)
+            job=staging-device
+            ;;
+
+          hope-audit-release-build-*)
+            job=release-build
+            ;;
+
+          *)
+            continue
+            ;;
+        esac
+
+        mkdir -p "audit/jobs/$job"
+
+        cp -a \
+          "$d/." \
+          "audit/jobs/$job/"
+      done
+
+      printf '%s\n' '${{ needs.backend-static.result }}' \
+        > audit/jobs/backend-static/job-status.txt
+
+      printf '%s\n' '${{ needs.backend-system.result }}' \
+        > audit/jobs/backend-system/job-status.txt
+
+      printf '%s\n' '${{ needs.mobile-static.result }}' \
+        > audit/jobs/mobile-static/job-status.txt
+
+      printf '%s\n' '${{ needs.android-emulator.result }}' \
+        > audit/jobs/android-emulator/job-status.txt
+
+      printf '%s\n' '${{ needs.staging-device.result }}' \
+        > audit/jobs/staging-device/job-status.txt
+
+      printf '%s\n' '${{ needs.release-build.result }}' \
+        > audit/jobs/release-build/job-status.txt
+
+  - name: Produce final report and enforce gate
+    run: |
+      tools/ci/aggregate_audit.sh audit
+
+  - name: Upload complete audit bundle
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: HOPE-FULL-AUDIT-COMPLETE-${{ github.run_id }}
+      path: audit
+      if-no-files-found: error
