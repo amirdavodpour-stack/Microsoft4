@@ -1,0 +1,55 @@
+name: Inspect HOPE Backend
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract ZIP and inspect database files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf .inspect
+          mkdir -p .inspect/source
+
+          ARCHIVE="$(find . -maxdepth 1 -type f -iname '*.zip' -print | sort | head -n 1)"
+
+          test -n "$ARCHIVE"
+
+          echo "Using archive: $ARCHIVE"
+
+          unzip -q "$ARCHIVE" -d .inspect/source
+
+          DB_FILE="$(find .inspect/source -type f -path '*/backend/src/db.js' -print | head -n 1)"
+          MIGRATE_FILE="$(find .inspect/source -type f -path '*/backend/src/migrate.js' -print | head -n 1)"
+
+          test -n "$DB_FILE"
+
+          echo "================ db.js ================"
+          nl -ba "$DB_FILE"
+
+          echo
+          echo "================ migrate.js ================"
+
+          if [ -n "$MIGRATE_FILE" ]; then
+            nl -ba "$MIGRATE_FILE"
+          else
+            echo "migrate.js not found"
+          fi
+
+          echo
+          echo "================ related files ================"
+
+          find .inspect/source -type f \
+            \( -path '*/backend/src/*' -o -path '*/backend/migrations/*' \) \
+            -print | sort
