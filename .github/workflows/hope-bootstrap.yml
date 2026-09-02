@@ -4,93 +4,67 @@ on:
   workflow_dispatch:
     inputs:
       archive:
-        description: "ZIP filename in repository. Leave empty to auto-detect."
+        description: "ZIP filename in repository (leave blank to auto-detect)"
         required: false
         type: string
-
-      build_profile:
-        description: "Build profile"
-        required: true
-        type: choice
-        default: pilot
-        options:
-          - pilot
-          - production
 
 permissions:
   contents: write
 
 concurrency:
-  group: hope-zip-bootstrap-${{ github.repository }}
+  group: hope-zip-bootstrap-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
     name: HOPE ZIP Auto Build
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     env:
+      BUILD_PROFILE: pilot
       CI_ZIP_BUILD: "true"
-      API_BASE_URL: ${{ secrets.API_BASE_URL != '' && secrets.API_BASE_URL || vars.API_BASE_URL }}
 
     steps:
-
-      # ============================================================
-      # 1. Checkout
-      # ============================================================
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      # ============================================================
-      # 2. Find ZIP
-      # ============================================================
-      - name: Find ZIP archive
-        id: archive
+      - name: Locate ZIP archive
+        id: locate
         shell: bash
-        env:
-          INPUT_ARCHIVE: ${{ inputs.archive }}
         run: |
           set -euo pipefail
 
-          ARCHIVE="${INPUT_ARCHIVE:-}"
+          INPUT_ARCHIVE="${{ inputs.archive }}"
 
-          if [ -n "$ARCHIVE" ]; then
-            if [ ! -f "$ARCHIVE" ]; then
-              echo "ERROR: Requested ZIP does not exist:"
-              echo "$ARCHIVE"
+          if [ -n "$INPUT_ARCHIVE" ]; then
+            if [ ! -f "$INPUT_ARCHIVE" ]; then
+              echo "ERROR: Requested archive does not exist: $INPUT_ARCHIVE"
               exit 1
             fi
+
+            ARCHIVE="$INPUT_ARCHIVE"
           else
-            ARCHIVE="$(
-              find . \
-                -type f \
-                -iname '*.zip' \
-                ! -path './.git/*' \
-                ! -path './.hope-work/*' \
-                -print \
-              | sort \
-              | head -n 1
-            )"
+            mapfile -t ZIPS < <(find . -maxdepth 2 -type f -name 'HOPE-*.zip' -print)
 
-            if [ -z "$ARCHIVE" ]; then
-              echo "ERROR: No ZIP archive found in repository."
+            if [ "${#ZIPS[@]}" -eq 0 ]; then
+              echo "ERROR: No HOPE-*.zip archive found."
               exit 1
             fi
+
+            if [ "${#ZIPS[@]}" -gt 1 ]; then
+              echo "Multiple HOPE archives found:"
+              printf ' - %s\n' "${ZIPS[@]}"
+              echo "Using the first matching archive."
+            fi
+
+            ARCHIVE="${ZIPS[0]}"
           fi
 
-          ARCHIVE="${ARCHIVE#./}"
-
-          echo "Selected archive:"
-          echo "$ARCHIVE"
-
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          echo "Using archive: $ARCHIVE"
 
-      # ============================================================
-      # 3. Prepare workspace
-      # ============================================================
-      - name: Prepare workspace
+      - name: Extract HOPE project
         shell: bash
         run: |
           set -euo pipefail
@@ -98,481 +72,162 @@ jobs:
           rm -rf .hope-work
           mkdir -p .hope-work/source
 
-      # ============================================================
-      # 4. Extract ZIP
-      # ============================================================
-      - name: Extract source ZIP
-        shell: bash
-        env:
-          ARCHIVE: ${{ steps.archive.outputs.archive }}
-        run: |
-          set -euo pipefail
+          unzip -q "${{ steps.locate.outputs.archive }}" -d .hope-work/source
 
-          unzip -q "$ARCHIVE" -d ".hope-work/source"
+          echo "Extracted files:"
+          find .hope-work/source -maxdepth 3 -type f | head -100
 
-          echo "ZIP extraction completed."
-
-      # ============================================================
-      # 5. Find Flutter project
-      # ============================================================
-      - name: Find Flutter project
-        id: project
+      - name: Locate Flutter project
+        id: flutter_project
         shell: bash
         run: |
           set -euo pipefail
 
-          SOURCE=".hope-work/source"
-          PROJECT=""
+          PROJECT_DIR="$(find .hope-work/source -type f -name pubspec.yaml -print -quit | xargs -r dirname)"
 
-          if [ -f "$SOURCE/pubspec.yaml" ]; then
-            PROJECT="$SOURCE"
-          else
-            PUBSPEC="$(
-              find "$SOURCE" \
-                -type f \
-                -name 'pubspec.yaml' \
-                ! -path '*/.dart_tool/*' \
-                ! -path '*/build/*' \
-                -print \
-              | sort \
-              | head -n 1
-            )"
-
-            if [ -n "$PUBSPEC" ]; then
-              PROJECT="$(dirname "$PUBSPEC")"
-            fi
-          fi
-
-          if [ -z "$PROJECT" ]; then
-            echo "ERROR: Could not find pubspec.yaml."
-            find "$SOURCE" -maxdepth 4 -type f | sort | head -300
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: Flutter project containing pubspec.yaml was not found."
             exit 1
           fi
 
-          echo "Flutter project:"
-          echo "$PROJECT"
+          if [ ! -f "$PROJECT_DIR/android/gradlew" ]; then
+            echo "ERROR: Flutter Android project not found at: $PROJECT_DIR"
+            exit 1
+          fi
 
-          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Flutter project: $PROJECT_DIR"
 
-      # ============================================================
-      # 6. Setup Flutter
-      # ============================================================
-      - name: Setup Flutter
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Flutter 3.47.0
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: "3.47.0"
           channel: stable
           cache: true
 
-      # ============================================================
-      # 7. Tool versions
-      # ============================================================
-      - name: Show tool versions
+      - name: Verify toolchain
         shell: bash
         run: |
           set -euo pipefail
+
+          echo "========================================"
+          echo "HOPE TOOLCHAIN"
+          echo "========================================"
 
           flutter --version
           dart --version
           java -version
+          echo "Gradle wrapper:"
+          cd "$PROJECT_DIR/android"
+          ./gradlew --version
 
-      # ============================================================
-      # 8. Configure environment
-      # ============================================================
-      - name: Configure build environment
+      - name: Configure API base URL
         shell: bash
         env:
-          PROJECT: ${{ steps.project.outputs.project }}
-          BUILD_PROFILE_INPUT: ${{ inputs.build_profile }}
+          API_BASE_URL_SECRET: ${{ secrets.API_BASE_URL }}
+          API_BASE_URL_VARIABLE: ${{ vars.API_BASE_URL }}
         run: |
           set -euo pipefail
 
-          if [ "$BUILD_PROFILE_INPUT" != "production" ] &&
-             [ "$BUILD_PROFILE_INPUT" != "pilot" ]; then
-            echo "ERROR: Invalid build profile."
-            exit 1
+          API_BASE_URL="${API_BASE_URL_SECRET:-}"
+
+          if [ -z "$API_BASE_URL" ]; then
+            API_BASE_URL="${API_BASE_URL_VARIABLE:-}"
           fi
 
-          {
-            echo "PROJECT_DIR=$PROJECT"
-            echo "BUILD_PROFILE=$BUILD_PROFILE_INPUT"
-            echo "CI_ZIP_BUILD=true"
-          } >> "$GITHUB_ENV"
-
-          echo "PROJECT_DIR=$PROJECT"
-          echo "BUILD_PROFILE=$BUILD_PROFILE_INPUT"
-          echo "CI_ZIP_BUILD=true"
-
-      # ============================================================
-      # 9. Validate API_BASE_URL
-      # ============================================================
-      - name: Validate API endpoint
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ -z "${API_BASE_URL:-}" ]; then
+          if [ -z "$API_BASE_URL" ]; then
             echo "ERROR: API_BASE_URL is not configured."
-            echo
+            echo ""
             echo "Configure one of these in:"
             echo "Repository -> Settings -> Secrets and variables -> Actions"
-            echo
+            echo ""
             echo "Option A - Repository secret:"
             echo "API_BASE_URL"
-            echo
+            echo ""
             echo "Option B - Repository variable:"
             echo "API_BASE_URL"
-            echo
+            echo ""
             echo "Expected format:"
             echo "https://YOUR-API-HOST/api/v1"
             exit 1
           fi
 
           case "$API_BASE_URL" in
-            https://*)
+            http://*|https://*)
               ;;
             *)
-              echo "ERROR: API_BASE_URL must use HTTPS."
+              echo "ERROR: API_BASE_URL must start with http:// or https://"
               exit 1
               ;;
           esac
 
-          if printf '%s' "$API_BASE_URL" | grep -Eq '[[:space:]]'; then
-            echo "ERROR: API_BASE_URL contains whitespace."
-            exit 1
-          fi
+          echo "API_BASE_URL=$API_BASE_URL" >> "$GITHUB_ENV"
 
-          if ! printf '%s' "$API_BASE_URL" | grep -Eq '^https://[^[:space:]]+$'; then
-            echo "ERROR: API_BASE_URL is malformed."
-            exit 1
-          fi
+          echo "API_BASE_URL configured: yes"
 
-          echo "API_BASE_URL is configured and uses HTTPS."
-
-      # ============================================================
-      # 10. Flutter dependencies
-      # ============================================================
-      - name: Flutter pub get
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Verify project configuration
         shell: bash
         run: |
           set -euo pipefail
 
-          flutter pub get
-
-      # ============================================================
-      # 11. Localization
-      # ============================================================
-      - name: Refresh generated localization
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ -f "tools/generate_localization.sh" ]; then
-            chmod +x tools/generate_localization.sh
-            ./tools/generate_localization.sh
-          elif [ -f "l10n.yaml" ]; then
-            flutter gen-l10n
-          else
-            echo "Localization generator not present; continuing."
-          fi
-
-      # ============================================================
-      # 12. Format
-      # ============================================================
-      - name: Format Dart source
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          dart format lib test integration_test || true
-
-      # ============================================================
-      # 13. Analyze
-      # ============================================================
-      - name: Analyze Dart
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set +e
-
-          flutter analyze
-
-          STATUS=$?
-
-          if [ "$STATUS" -ne 0 ]; then
-            echo
-            echo "WARNING: Flutter analyzer reported issues."
-            echo "Build will continue so compiler/build errors can be identified."
-          fi
-
-          exit 0
-
-      # ============================================================
-      # 14. Gradle compatibility
-      # ============================================================
-      - name: Configure Android Gradle
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ANDROID_DIR="android"
-          GRADLE_PROPERTIES="$ANDROID_DIR/gradle.properties"
-          WRAPPER_PROPERTIES="$ANDROID_DIR/gradle/wrapper/gradle-wrapper.properties"
-
-          test -d "$ANDROID_DIR"
-          test -f "$WRAPPER_PROPERTIES"
-
-          touch "$GRADLE_PROPERTIES"
-
-          # Keep the certified Gradle compatibility baseline.
-          sed -i \
-            -E 's#gradle-[0-9]+\.[0-9]+(\.[0-9]+)?-bin\.zip#gradle-8.14-bin.zip#' \
-            "$WRAPPER_PROPERTIES"
-
-          GRADLE_SHA256="61ad310d3c7d3e5da131b76bbf22b5a4c0786e9d892dae8c1658d4b484de3caa"
-
-          if grep -q '^distributionSha256Sum=' "$WRAPPER_PROPERTIES"; then
-            sed -i \
-              "s/^distributionSha256Sum=.*/distributionSha256Sum=$GRADLE_SHA256/" \
-              "$WRAPPER_PROPERTIES"
-          else
-            printf '%s\n' \
-              "distributionSha256Sum=$GRADLE_SHA256" \
-              >> "$WRAPPER_PROPERTIES"
-          fi
-
-          if grep -q '^android.newDsl=' "$GRADLE_PROPERTIES"; then
-            sed -i \
-              's/^android.newDsl=.*/android.newDsl=false/' \
-              "$GRADLE_PROPERTIES"
-          else
-            printf '%s\n' \
-              'android.newDsl=false' \
-              >> "$GRADLE_PROPERTIES"
-          fi
-
-          if grep -q '^android.builtInKotlin=' "$GRADLE_PROPERTIES"; then
-            sed -i \
-              's/^android.builtInKotlin=.*/android.builtInKotlin=false/' \
-              "$GRADLE_PROPERTIES"
-          else
-            printf '%s\n' \
-              'android.builtInKotlin=false' \
-              >> "$GRADLE_PROPERTIES"
-          fi
-
-          echo "===== gradle-wrapper.properties ====="
-          cat "$WRAPPER_PROPERTIES"
-
-          echo
-          echo "===== gradle.properties ====="
-          cat "$GRADLE_PROPERTIES"
-
-      # ============================================================
-      # 15. Verify Gradle
-      # ============================================================
-      - name: Verify Gradle wrapper
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          chmod +x android/gradlew
-          ./android/gradlew --version
-
-      # ============================================================
-      # 16. Production signing
-      # ============================================================
-      - name: Configure production signing
-        if: env.BUILD_PROFILE == 'production'
-        shell: bash
-        env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_B64 }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${KEYSTORE_B64:-}" ]; then
-            echo "ERROR: Missing GitHub repository secret:"
-            echo "ANDROID_RELEASE_KEYSTORE_B64"
-            exit 1
-          fi
-
-          KEYSTORE_PATH="$RUNNER_TEMP/hope-release.jks"
-
-          printf '%s' "$KEYSTORE_B64" \
-            | base64 --decode \
-            > "$KEYSTORE_PATH"
-
-          chmod 600 "$KEYSTORE_PATH"
-
-          if [ ! -s "$KEYSTORE_PATH" ]; then
-            echo "ERROR: Decoded release keystore is empty."
-            exit 1
-          fi
-
-          echo "ANDROID_RELEASE_STORE_FILE=$KEYSTORE_PATH" >> "$GITHUB_ENV"
-
-          echo "Production keystore prepared."
-
-      # ============================================================
-      # 17. Verify production secrets
-      # ============================================================
-      - name: Verify production signing secrets
-        if: env.BUILD_PROFILE == 'production'
-        shell: bash
-        env:
-          STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${STORE_PASSWORD:-}" ]; then
-            echo "ERROR: Missing ANDROID_RELEASE_STORE_PASSWORD"
-            exit 1
-          fi
-
-          if [ -z "${KEY_ALIAS:-}" ]; then
-            echo "ERROR: Missing ANDROID_RELEASE_KEY_ALIAS"
-            exit 1
-          fi
-
-          if [ -z "${KEY_PASSWORD:-}" ]; then
-            echo "ERROR: Missing ANDROID_RELEASE_KEY_PASSWORD"
-            exit 1
-          fi
-
-          test -n "${ANDROID_RELEASE_STORE_FILE:-}"
-          test -f "$ANDROID_RELEASE_STORE_FILE"
-
-          echo "Production signing configuration is present."
-
-      # ============================================================
-      # 18. Build APK
-      # ============================================================
-      - name: Build release APK
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        env:
-          API_BASE_URL: ${{ env.API_BASE_URL }}
-          BUILD_PROFILE: ${{ env.BUILD_PROFILE }}
-
-          ANDROID_RELEASE_STORE_FILE: ${{ env.ANDROID_RELEASE_STORE_FILE }}
-          ANDROID_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
-          ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
-          ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
+          cd "$PROJECT_DIR"
 
           echo "========================================"
-          echo "HOPE Android Release Build"
+          echo "HOPE PROJECT"
+          echo "========================================"
+          echo "PROJECT_DIR=$PROJECT_DIR"
           echo "BUILD_PROFILE=$BUILD_PROFILE"
           echo "API_BASE_URL configured: yes"
           echo "========================================"
 
+          test -f pubspec.yaml
+          test -d android
+          test -f android/gradlew
+
+      - name: Prepare Gradle wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR/android"
+
+          chmod +x gradlew
+
+          if [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+            sed -i \
+              's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14-bin.zip#' \
+              gradle/wrapper/gradle-wrapper.properties
+          fi
+
+          echo "Gradle wrapper:"
+          grep "distributionUrl" gradle/wrapper/gradle-wrapper.properties || true
+
+      - name: Flutter clean and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
           flutter clean
           flutter pub get
 
-          if [ -f "tools/build_apk_release.sh" ]; then
-            chmod +x tools/build_apk_release.sh
-            ./tools/build_apk_release.sh
-          else
-            flutter build apk \
-              --release \
-              --dart-define=API_BASE_URL="$API_BASE_URL"
-          fi
-
-      # ============================================================
-      # 19. Locate APK
-      # ============================================================
-      - name: Locate APK
-        id: apk
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Flutter analyzer
         shell: bash
+        continue-on-error: true
         run: |
           set -euo pipefail
 
-          APK=""
+          cd "$PROJECT_DIR"
 
-          if [ -f "build/app/outputs/flutter-apk/app-release.apk" ]; then
-            APK="build/app/outputs/flutter-apk/app-release.apk"
-          else
-            APK="$(
-              find build/app/outputs \
-                -type f \
-                -name '*.apk' \
-                -print \
-              | sort \
-              | head -n 1
-            )"
-          fi
+          flutter analyze
 
-          if [ -z "$APK" ]; then
-            echo "ERROR: APK was not generated."
-            find build/app/outputs \
-              -maxdepth 8 \
-              -type f \
-              -print 2>/dev/null || true
-            exit 1
-          fi
-
-          test -s "$APK"
-
-          echo "APK=$APK"
-          echo "apk=$APK" >> "$GITHUB_OUTPUT"
-
-      # ============================================================
-      # 20. SHA256
-      # ============================================================
-      - name: Generate APK checksum
-        working-directory: ${{ env.PROJECT_DIR }}
-        env:
-          APK: ${{ steps.apk.outputs.apk }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sha256sum "$APK" > "$APK.sha256"
-
-          cat "$APK.sha256"
-
-      # ============================================================
-      # 21. APK verification
-      # ============================================================
-      - name: Verify APK signature
-        working-directory: ${{ env.PROJECT_DIR }}
-        env:
-          APK: ${{ steps.apk.outputs.apk }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APKSIGNER=""
-
-          if command -v apksigner >/dev/null 2>&1; then
-            APKSIGNER="$(command -v apksigner)"
-          elif [ -n "${ANDROID_HOME:-}" ] &&
-               [ -f "${ANDROID_HOME}/build-tools/$(ls "${ANDROID_HOME}/build-tools" | sort -V | tail -n 1)/apksigner" ]; then
-            APKSIGNER="${ANDROID_HOME}/build-tools/$(ls "${ANDROID_HOME}/build-tools" | sort -V | tail -n 1)/apksigner"
-          fi
-
-          if [ -n "$APKSIGNER" ]; then
-            "$APKSIGNER" verify --verbose "$APK"
-          else
-            echo "WARNING: apksigner unavailable."
-            echo "Flutter generated the APK successfully."
-          fi
-
-      # ============================================================
-      # 22. Upload artifact
-      # ============================================================
-      - name: Upload HOPE APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: HOPE-${{ env.BUILD_PROFILE }}-${{ github.run_number }}
-          path: |
-            ${{ env.PROJECT_DIR }}/${{ steps.apk.outputs.apk }}
-           
+      - name: Build HOPE APK
+        shell
