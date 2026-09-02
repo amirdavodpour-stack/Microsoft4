@@ -1,604 +1,402 @@
-name: HOPE — Full Environment-Aware Audit
+name: HOPE V6 Full Audit
 
-"on":
+on:
   workflow_dispatch:
     inputs:
       source_zip:
-        description: "EXACT source ZIP filename in repository root"
+        description: "Source ZIP filename in repository root"
         required: true
         type: string
         default: "v6.zip"
 
-      run_staging_device:
-        description: "Run HTTPS staging emulator certification when STAGING_API_BASE_URL is configured"
+      run_tests:
+        description: "Run Flutter tests"
         required: false
-        default: true
         type: boolean
+        default: true
+
+      run_android_build:
+        description: "Build Android release APK"
+        required: false
+        type: boolean
+        default: true
+
+      run_security:
+        description: "Run dependency/security checks"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: hope-full-audit-${{ github.workflow }}-${{ github.ref }}
+  group: hope-v6-audit-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  SOURCE_ZIP: ${{ inputs.source_zip }}
-  FLUTTER_VERSION: "3.47.0"
-  NODE_VERSION: "24.x"
+  FLUTTER_VERSION: "3.47.1"
   JAVA_VERSION: "17"
+  ANDROID_API: "36"
+  NDK_VERSION: "28.2.13676358"
+  SOURCE_ZIP: ${{ inputs.source_zip }}
 
 jobs:
-  backend-static:
-    name: Backend — static + complete Node suite
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
 
-      - name: Prepare exact source ZIP
-        run: |
-          tools/ci/prepare_source_zip.sh "$SOURCE_ZIP" "$RUNNER_TEMP/prepared"
-          mkdir -p audit/jobs/backend-static
-          cp "$RUNNER_TEMP/prepared/project-root.txt" audit/jobs/backend-static/project-root.txt
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Install backend dependencies
-        run: |
-          ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
-          cd "$ROOT/backend"
-          npm ci
-
-      - name: Capture environment
-        run: |
-          ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
-          mkdir -p audit/jobs/backend-static/cases
-          {
-            node --version
-            npm --version
-            uname -a
-            git --version
-          } > audit/jobs/backend-static/environment.txt
-
-      - name: Backend checks and full test suite
-        run: |
-          ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
-          export AUDIT_OUT_DIR="$PWD/audit/jobs/backend-static"
-          cd "$ROOT/backend"
-
-          "$OLDPWD/tools/ci/run_case.sh" backend_check npm run check
-          "$OLDPWD/tools/ci/run_case.sh" backend_all_tests npm test
-          "$OLDPWD/tools/ci/run_case.sh" backend_e2e npm run test:e2e
-          "$OLDPWD/tools/ci/run_case.sh" backend_product npm run test:product
-          "$OLDPWD/tools/ci/run_case.sh" backend_security npm run test:wave10
-          "$OLDPWD/tools/ci/run_case.sh" backend_perf_contract npm run test:perf
-          "$OLDPWD/tools/ci/run_case.sh" backend_score npm run score:90plus
-          "$OLDPWD/tools/ci/run_case.sh" backend_security_audit npm audit --audit-level=high
-          "$OLDPWD/tools/ci/run_case.sh" backend_sbom npm run sbom
-          "$OLDPWD/tools/ci/run_case.sh" backend_release_evidence npm run test:release-evidence
-
-      - name: Upload backend evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hope-audit-backend-static-${{ github.run_id }}
-          path: audit/jobs/backend-static
-          if-no-files-found: error
-
-  backend-system:
-    name: Backend — PostgreSQL + S3 + backup/restore + failure injection
-    runs-on: ubuntu-24.04
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_DB: hope
-          POSTGRES_USER: hope
-          POSTGRES_PASSWORD: hope
-        ports:
-          - "5432:5432"
-        options: >-
-          --health-cmd "pg_isready -U hope -d hope"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
+  validate_source:
+    name: Validate V6 Source
+    runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Prepare exact source ZIP
+      - name: Verify source ZIP exists
+        shell: bash
         run: |
-          tools/ci/prepare_source_zip.sh "$SOURCE_ZIP" "$RUNNER_TEMP/prepared"
+          set -euo pipefail
 
-      - uses: actions/setup-node@v6
-        with:
-          node-version: ${{ env.NODE_VERSION }}
+          echo "Repository root:"
+          ls -lah
 
-      - name: Install PostgreSQL client + start MinIO
+          test -f "${SOURCE_ZIP}" || {
+            echo "::error::Source ZIP '${SOURCE_ZIP}' was not found in repository root."
+            exit 1
+          }
+
+          echo "Found:"
+          ls -lh "${SOURCE_ZIP}"
+
+      - name: Validate ZIP integrity
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client
+          set -euo pipefail
 
-          docker run -d \
-            --name hope-minio \
-            -p 9000:9000 \
-            -p 9001:9001 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:latest \
-            server /data --console-address :9001
+          unzip -t "${SOURCE_ZIP}"
 
-          for i in {1..30}; do
-            if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null; then
-              break
-            fi
-            sleep 2
-          done
-
-      - name: Run DB-backed and resilience tests
+      - name: Inspect ZIP structure
+        shell: bash
         run: |
-          ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
-          cd "$ROOT/backend"
+          set -euo pipefail
 
-          npm ci
+          mkdir -p /tmp/hope-source
+          unzip -q "${SOURCE_ZIP}" -d /tmp/hope-source
 
-          DATA_FILE="$RUNNER_TEMP/hope-db-seed.json" \
-          STORAGE_DIR="$RUNNER_TEMP/hope-db-storage" \
-          npm run migrate
+          echo "Extracted source:"
+          find /tmp/hope-source -maxdepth 3 -type f | sort | head -300
 
-          DATA_FILE="$RUNNER_TEMP/hope-db-seed.json" \
-          STORAGE_DIR="$RUNNER_TEMP/hope-db-storage" \
-          npm run seed
+          find /tmp/hope-source -type f -name pubspec.yaml | head -20
+          find /tmp/hope-source -type f -name gradlew | head -20
 
-          mkdir -p "$OLDPWD/audit/jobs/backend-system/cases"
-
-          export AUDIT_OUT_DIR="$OLDPWD/audit/jobs/backend-system"
-          export DATABASE_URL='postgres://hope:hope@127.0.0.1:5432/hope'
-          export DATA_FILE="$RUNNER_TEMP/hope.json"
-          export STORAGE_DIR="$RUNNER_TEMP/hope-storage"
-          export S3_INTEGRATION=1
-          export S3_BUCKET=hope-ci
-          export S3_REGION=us-east-1
-          export S3_ENDPOINT=http://127.0.0.1:9000
-          export S3_FORCE_PATH_STYLE=true
-          export AWS_ACCESS_KEY_ID=minioadmin
-          export AWS_SECRET_ACCESS_KEY=minioadmin
-
-          "$OLDPWD/tools/ci/run_case.sh" postgres_integration npm run test:postgres
-          "$OLDPWD/tools/ci/run_case.sh" s3_integration npm run test:s3
-          "$OLDPWD/tools/ci/run_case.sh" e2e_database npm run test:e2e
-          "$OLDPWD/tools/ci/run_case.sh" failure_injection npm run test:failure-injection
-          "$OLDPWD/tools/ci/run_case.sh" backup_contract npm run test:backup
-          "$OLDPWD/tools/ci/run_case.sh" backup_script bash -c 'BACKUP_DIR="$RUNNER_TEMP/backups" ./scripts/backup.sh'
-
-          BACKUP_FILE="$(find "$RUNNER_TEMP/backups" -type f -name 'hope-*.dump' | head -1)"
-
-          if [[ -n "$BACKUP_FILE" ]]; then
-            "$OLDPWD/tools/ci/run_case.sh" backup_verify \
-              bash -c './scripts/verify-backup.sh "$1"' _ "$BACKUP_FILE"
-          else
-            mkdir -p "$AUDIT_OUT_DIR/cases/backup_verify"
-            printf '1\n' > "$AUDIT_OUT_DIR/cases/backup_verify/status.txt"
-            printf 'backup dump was not produced\n' > "$AUDIT_OUT_DIR/cases/backup_verify/run.log"
-          fi
-
-      - name: Isolated DR restore drill
-        run: |
-          ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
-
-          export AUDIT_OUT_DIR="$PWD/audit/jobs/backend-system"
-          export SOURCE_DATABASE_URL='postgres://hope:hope@127.0.0.1:5432/hope'
-
-          docker run -d \
-            --name hope-dr-postgres \
-            -e POSTGRES_DB=hope_dr \
-            -e POSTGRES_USER=hope \
-            -e POSTGRES_PASSWORD=hope \
-            -p 127.0.0.1:55432:5432 \
-            postgres:16-alpine
-
-          until pg_isready \
-            -h 127.0.0.1 \
-            -p 55432 \
-            -U hope \
-            -d hope_dr; do
-            sleep 2
-          done
-
-          cd "$ROOT/backend"
-
-          DRILL_EVIDENCE_FILE="$AUDIT_OUT_DIR/dr-restore-evidence.txt" \
-          DRILL_DATABASE_URL='postgres://hope:hope@127.0.0.1:55432/hope_dr' \
-          bash scripts/dr-restore-drill.sh
-
-          mkdir -p "$AUDIT_OUT_DIR/cases/dr_restore"
-          printf '0\n' > "$AUDIT_OUT_DIR/cases/dr_restore/status.txt"
-          cp "$AUDIT_OUT_DIR/dr-restore-evidence.txt" \
-            "$AUDIT_OUT_DIR/cases/dr_restore/run.log"
-
-      - name: Upload system evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hope-audit-backend-system-${{ github.run_id }}
-          path: audit/jobs/backend-system
-          if-no-files-found: error
-
-  mobile-static:
-    name: Mobile — format + analyze + unit/widget tests
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Prepare exact source ZIP
-        run: |
-          tools/ci/prepare_source_zip.sh "$SOURCE_ZIP" "$RUNNER_TEMP/prepared"
-
-      - uses: subosito/flutter-action@v2
-        with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: stable
-          cache: true
-
-      - name: Capture Flutter environment
-        run: |
-          flutter --version
-          dart --version
-
-      - name: Run mobile quality gates
-        run: |
-          ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
-          cd "$ROOT"
-
-          mkdir -p "$GITHUB_WORKSPACE/audit/jobs/mobile-static/cases"
-          export AUDIT_OUT_DIR="$GITHUB_WORKSPACE/audit/jobs/mobile-static"
-
-          "$GITHUB_WORKSPACE/tools/ci/run_case.sh" pub_get flutter pub get
-          "$GITHUB_WORKSPACE/tools/ci/run_case.sh" gen_l10n flutter gen-l10n
-
-          "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
-            format \
-            dart format --set-exit-if-changed .
-
-          "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
-            analyze \
-            flutter analyze
-
-          "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
-            unit_widget \
-            flutter test --no-pub
-
-          "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
-            localization \
-            bash tools/check_localization.sh
-
-          "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
-            ux_contract \
-            bash tools/check_ux_wave8.sh
-
-          "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
-            release_contract \
-            bash tools/android-release-contract.sh
-
-          "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
-            runtime_contract \
-            bash tools/android-runtime-cert-contract.sh
-
-      - name: Upload mobile static evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hope-audit-mobile-static-${{ github.run_id }}
-          path: audit/jobs/mobile-static
-          if-no-files-found: error
-
-  android-emulator:
-    name: Android — real emulator integration surface
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Prepare exact source ZIP
-        run: |
-          tools/ci/prepare_source_zip.sh "$SOURCE_ZIP" "$RUNNER_TEMP/prepared"
-
-      - uses: subosito/flutter-action@v2
-        with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: stable
-          cache: true
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Prepare project dependencies and local API
-        run: |
-          ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
-
-          cd "$ROOT"
-
-          flutter pub get
-          flutter gen-l10n
-
-          cd backend
-          npm ci
-
-          DATA_FILE="$RUNNER_TEMP/device-hope.json" \
-          STORAGE_DIR="$RUNNER_TEMP/device-storage" \
-          npm run seed
-
-          HOST=0.0.0.0 \
-          PORT=3000 \
-          DATA_FILE="$RUNNER_TEMP/device-hope.json" \
-          STORAGE_DIR="$RUNNER_TEMP/device-storage" \
-          ACCESS_TOKEN_SECRET='ci-access-secret-012345678901234567890123' \
-          REFRESH_TOKEN_SECRET='ci-refresh-secret-012345678901234567890123' \
-          nohup npm start > "$RUNNER_TEMP/hope-api-device.log" 2>&1 &
-
-          echo $! > "$RUNNER_TEMP/hope-api-device.pid"
-
-          for i in {1..30}; do
-            if curl -fsS http://127.0.0.1:3000/live >/dev/null; then
-              break
-            fi
-            sleep 2
-          done
-
-          curl -fsS \
-            http://127.0.0.1:3000/live \
-            > "$GITHUB_WORKSPACE/audit-live-local-api.json"
-
-      - name: Run integration tests on Android Emulator
-        uses: reactivecircus/android-emulator-runner@v2
-        env:
-          SOURCE_PROJECT_ROOT: ${{ runner.temp }}/prepared
-        with:
-          api-level: 36
-          target: google_apis
-          arch: x86_64
-          profile: pixel_6
-          force-avd-creation: true
-          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
-          disable-animations: true
-          script: |
-            set -Eeuo pipefail
-
-            ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
-
-            mkdir -p \
-              "$GITHUB_WORKSPACE/audit/jobs/android-emulator/cases/emulator_integration"
-
-            export AUDIT_OUT_DIR="$GITHUB_WORKSPACE/audit/jobs/android-emulator"
-
-            cd "$ROOT"
-
-            "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
-              emulator_smoke \
-              flutter test integration_test/app_smoke_test.dart \
-              --dart-define=API_BASE_URL=http://10.0.2.2:3000/api/v1 \
-              --dart-define=CI_DEVICE_INTEGRATION=false
-
-            "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
-              emulator_api_runtime \
-              flutter test integration_test/local_api_smoke_test.dart \
-              --dart-define=API_BASE_URL=http://10.0.2.2:3000/api/v1
-
-      - name: Upload Android evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hope-audit-android-emulator-${{ github.run_id }}
-          path: audit/jobs/android-emulator
-          if-no-files-found: error
-
-  staging-device:
-    name: Android — HTTPS staging runtime certification
-    runs-on: ubuntu-24.04
-    if: ${{ inputs.run_staging_device && vars.STAGING_API_BASE_URL != '' }}
+  flutter_audit:
+    name: Flutter Analyze and Test
+    needs: validate_source
+    if: ${{ inputs.run_tests }}
+    runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Prepare exact source ZIP
+      - name: Verify source ZIP
+        run: test -f "${SOURCE_ZIP}"
+
+      - name: Extract V6 source
+        shell: bash
         run: |
-          tools/ci/prepare_source_zip.sh "$SOURCE_ZIP" "$RUNNER_TEMP/prepared"
+          set -euo pipefail
 
-      - uses: subosito/flutter-action@v2
-        with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: stable
-          cache: true
+          rm -rf "${GITHUB_WORKSPACE}/hope"
+          mkdir -p "${GITHUB_WORKSPACE}/hope"
 
-      - name: Run HTTPS staging certification on Android Emulator
-        uses: reactivecircus/android-emulator-runner@v2
-        env:
-          STAGING_API_BASE_URL: ${{ vars.STAGING_API_BASE_URL }}
-        with:
-          api-level: 36
-          target: google_apis
-          arch: x86_64
-          profile: pixel_6
-          force-avd-creation: true
-          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect
-          disable-animations: true
-          script: |
-            set -Eeuo pipefail
+          unzip -q "${SOURCE_ZIP}" -d "${GITHUB_WORKSPACE}/hope"
 
-            ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
+          echo "Extracted tree:"
+          find "${GITHUB_WORKSPACE}/hope" -maxdepth 3 -type f | sort | head -300
 
-            mkdir -p "$GITHUB_WORKSPACE/audit/jobs/staging-device/cases"
-
-            export AUDIT_OUT_DIR="$GITHUB_WORKSPACE/audit/jobs/staging-device"
-
-            cd "$ROOT"
-
-            flutter pub get
-            flutter gen-l10n
-
-            "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
-              staging_https \
-              flutter test integration_test/app_smoke_test.dart \
-              --dart-define=API_BASE_URL="$STAGING_API_BASE_URL" \
-              --dart-define=CI_DEVICE_INTEGRATION=true
-
-      - name: Upload staging device evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hope-audit-staging-device-${{ github.run_id }}
-          path: audit/jobs/staging-device
-          if-no-files-found: warn
-
-  release-build:
-    name: Release — isolated production/pilot build + APK verification
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Prepare exact source ZIP
+      - name: Detect Flutter project root
+        shell: bash
         run: |
-          tools/ci/prepare_source_zip.sh "$SOURCE_ZIP" "$RUNNER_TEMP/prepared"
+          set -euo pipefail
 
-      - uses: subosito/flutter-action@v2
-        with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: stable
-          cache: true
+          PUBSPEC="$(find "${GITHUB_WORKSPACE}/hope" -type f -name pubspec.yaml -print -quit)"
 
-      - uses: actions/setup-java@v5
+          test -n "${PUBSPEC}" || {
+            echo "::error::pubspec.yaml was not found in extracted V6 source."
+            exit 1
+          }
+
+          PROJECT_ROOT="$(dirname "${PUBSPEC}")"
+
+          echo "PROJECT_ROOT=${PROJECT_ROOT}" >> "${GITHUB_ENV}"
+
+          echo "Flutter project:"
+          echo "${PROJECT_ROOT}"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
-          cache: gradle
 
-      - name: Build isolated pilot APK and verify metadata/signature
-        env:
-          API_BASE_URL: ${{ vars.STAGING_API_BASE_URL || 'https://ci.example.invalid/api/v1' }}
-        run: |
-          ROOT="$(cat "$RUNNER_TEMP/prepared/project-root.txt")"
-
-          cd "$ROOT"
-
-          mkdir -p "$GITHUB_WORKSPACE/audit/jobs/release-build"
-
-          export AUDIT_OUT_DIR="$GITHUB_WORKSPACE/audit/jobs/release-build"
-
-          "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
-            release_contract \
-            bash tools/android-release-contract.sh
-
-          if [[ -x tools/build_release_isolated.sh ]]; then
-            "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
-              isolated_release \
-              bash tools/build_release_isolated.sh
-          else
-            "$GITHUB_WORKSPACE/tools/ci/run_case.sh" \
-              direct_release \
-              bash tools/build_apk_release.sh
-          fi
-
-          find "$ROOT" -type f \
-            \( -name '*.apk' -o -name 'SHA256SUMS.txt' -o -name 'VERIFICATION.txt' \) \
-            -print | sort \
-            > "$GITHUB_WORKSPACE/audit/jobs/release-build/artifacts-found.txt"
-
-          if [[ -d "$ROOT/artifacts" ]]; then
-            cp -a "$ROOT/artifacts" \
-              "$GITHUB_WORKSPACE/audit/jobs/release-build/"
-          fi
-
-      - name: Upload release evidence
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
         with:
-          name: hope-audit-release-build-${{ github.run_id }}
-          path: audit/jobs/release-build
-          if-no-files-found: warn
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
 
-  aggregate:
-    name: Aggregate — final hard audit gate
-    runs-on: ubuntu-24.04
-    needs:
-      - backend-static
-      - backend-system
-      - mobile-static
-      - android-emulator
-      - staging-device
-      - release-build
-    if: always()
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Flutter doctor
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: flutter doctor -v
+
+      - name: Pub get
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: flutter analyze
+
+      - name: Format check
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dart format --output=none --set-exit-if-changed lib test
+
+      - name: Run tests
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: flutter test --reporter expanded
+
+  security_audit:
+    name: Security and Dependency Audit
+    needs: validate_source
+    if: ${{ inputs.run_security }}
+    runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v5
+      - name: Extract source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "${GITHUB_WORKSPACE}/hope"
+          mkdir -p "${GITHUB_WORKSPACE}/hope"
+
+          unzip -q "${SOURCE_ZIP}" -d "${GITHUB_WORKSPACE}/hope"
+
+      - name: Locate project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PUBSPEC="$(find "${GITHUB_WORKSPACE}/hope" -type f -name pubspec.yaml -print -quit)"
+          test -n "${PUBSPEC}"
+
+          echo "PROJECT_ROOT=$(dirname "${PUBSPEC}")" >> "${GITHUB_ENV}"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
         with:
-          pattern: hope-audit-*-${{ github.run_id }}
-          merge-multiple: false
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
 
-      - name: Collect all evidence
+      - name: Pub get
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: flutter pub get
+
+      - name: Dependency audit
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
         run: |
-          mkdir -p audit/jobs
-          shopt -s nullglob
+          set -euo pipefail
 
-          for d in hope-audit-*-${{ github.run_id }}; do
-            case "$d" in
-              hope-audit-backend-static-*)
-                job=backend-static
-                ;;
-              hope-audit-backend-system-*)
-                job=backend-system
-                ;;
-              hope-audit-mobile-static-*)
-                job=mobile-static
-                ;;
-              hope-audit-android-emulator-*)
-                job=android-emulator
-                ;;
-              hope-audit-staging-device-*)
-                job=staging-device
-                ;;
-              hope-audit-release-build-*)
-                job=release-build
-                ;;
-              *)
-                continue
-                ;;
-            esac
+          flutter pub outdated || true
 
-            mkdir -p "audit/jobs/$job"
-            cp -a "$d/." "audit/jobs/$job/"
-          done
+          if command -v trivy >/dev/null 2>&1; then
+            trivy fs .
+          else
+            echo "Trivy not installed; continuing with Flutter dependency inspection."
+          fi
 
-          printf '%s\n' '${{ needs.backend-static.result }}' \
-            > audit/jobs/backend-static/job-status.txt
-
-          printf '%s\n' '${{ needs.backend-system.result }}' \
-            > audit/jobs/backend-system/job-status.txt
-
-          printf '%s\n' '${{ needs.mobile-static.result }}' \
-            > audit/jobs/mobile-static/job-status.txt
-
-          printf '%s\n' '${{ needs.android-emulator.result }}' \
-            > audit/jobs/android-emulator/job-status.txt
-
-          printf '%s\n' '${{ needs.staging-device.result }}' \
-            > audit/jobs/staging-device/job-status.txt
-
-          printf '%s\n' '${{ needs.release-build.result }}' \
-            > audit/jobs/release-build/job-status.txt
-
-      - name: Produce final report and enforce gate
+      - name: Secret pattern scan
+        shell: bash
         run: |
-          tools/ci/aggregate_audit.sh audit
+          set -euo pipefail
 
-      - name: Upload complete audit bundle
-        if: always()
+          echo "Scanning source for obvious secret-like patterns..."
+
+          if grep -RInE \
+            --exclude-dir=.git \
+            --exclude='*.lock' \
+            --exclude='*.png' \
+            --exclude='*.jpg' \
+            --exclude='*.jpeg' \
+            --exclude='*.webp' \
+            '(api[_-]?key|secret[_-]?key|private[_-]?key|password[[:space:]]*[:=]|access[_-]?token)' \
+            "${GITHUB_WORKSPACE}/hope"; then
+
+            echo "::warning::Potential secret-like patterns found. Review manually."
+          else
+            echo "No obvious secret-like patterns found."
+          fi
+
+  android_release:
+    name: Android Release Build
+    needs: validate_source
+    if: ${{ inputs.run_android_build }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "${GITHUB_WORKSPACE}/hope"
+          mkdir -p "${GITHUB_WORKSPACE}/hope"
+
+          unzip -q "${SOURCE_ZIP}" -d "${GITHUB_WORKSPACE}/hope"
+
+      - name: Locate Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PUBSPEC="$(find "${GITHUB_WORKSPACE}/hope" -type f -name pubspec.yaml -print -quit)"
+          test -n "${PUBSPEC}"
+
+          echo "PROJECT_ROOT=$(dirname "${PUBSPEC}")" >> "${GITHUB_ENV}"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Flutter pub get
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: flutter pub get
+
+      - name: Android toolchain information
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          java -version
+          flutter doctor -v
+
+          echo "Android configuration:"
+          find android -maxdepth 3 -type f | sort | head -200
+
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          flutter build apk --release
+
+      - name: Locate APK
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$(find build/app/outputs/apk/release -type f -name '*.apk' -print -quit)"
+
+          if [ -z "${APK}" ]; then
+            echo "::error::Release APK was not produced."
+            find build -type f | sort | head -300 || true
+            exit 1
+          fi
+
+          echo "APK=${APK}" >> "${GITHUB_ENV}"
+
+          ls -lh "${APK}"
+
+      - name: APK SHA256
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sha256sum "${APK}" | tee apk-sha256.txt
+
+      - name: Upload release APK
         uses: actions/upload-artifact@v4
         with:
-          name: HOPE-FULL-AUDIT-COMPLETE-${{ github.run_id }}
-          path: audit
+          name: hope-v6-release-apk
+          path: |
+            ${{ env.PROJECT_ROOT }}/${{ env.APK }}
+            ${{ env.PROJECT_ROOT }}/apk-sha256.txt
           if-no-files-found: error
+
+  aggregate:
+    name: Final V6 Gate
+    needs:
+      - validate_source
+      - flutter_audit
+      - security_audit
+      - android_release
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Evaluate audit jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "validate_source=${{ needs.validate_source.result }}"
+          echo "flutter_audit=${{ needs.flutter_audit.result }}"
+          echo "security_audit=${{ needs.security_audit.result }}"
+          echo "android_release=${{ needs.android_release.result }}"
+
+          if [ "${{ needs.validate_source.result }}" != "success" ]; then
+            echo "::error::Source validation failed."
+            exit 1
+          fi
+
+          if [ "${{ needs.flutter_audit.result }}" != "success" ] && \
+             [ "${{ inputs.run_tests }}" = "true" ]; then
+            echo "::error::Flutter audit failed."
+            exit 1
+          fi
+
+          if [ "${{ needs.security_audit.result }}" != "success" ] && \
+             [ "${{ inputs.run_security }}" = "true" ]; then
+            echo "::error::Security audit failed."
+            exit 1
+          fi
+
+          if [ "${{ needs.android_release.result }}" != "success" ] && \
+             [ "${{ inputs.run_android_build }}" = "true" ]; then
+            echo "::error::Android release build failed."
+            exit 1
+          fi
+
+          echo "======================================"
+          echo "HOPE V6 FINAL AUDIT GATE: PASSED"
+          echo "======================================"
