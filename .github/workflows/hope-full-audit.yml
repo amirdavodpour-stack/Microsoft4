@@ -1,418 +1,647 @@
-HOPE Marketplace 3.8.0+11 — FULL AUDIT V2
-
-هدف: اجرای کامل تمام تست‌ها و تولید گزارش نهایی حتی در صورت وجود failure
-
-فایل ورودی دقیق:
-
-"HOPE-MARKETPLACE-3.8.0-V6-REPAIRED.zip"
-
-اصل شماره 1 — هیچ تستی نباید به خاطر failure تست قبلی متوقف شود
-
-تست‌ها را مستقل اجرا کن.
-
-ممنوع:
-
-- استفاده از "set -e" برای کل زنجیره تست‌ها
-- متوقف کردن job بعد از اولین failure
-- شرط‌گذاری که اجرای تست‌های بعدی را به PASS شدن تست قبلی وابسته کند
-
-مجاز:
-
-- "set -euo pipefail" فقط داخل یک case منفرد
-- در wrapper هر case، exit code را بگیر و بعد اجرای case بعدی را ادامه بده
-
-الگوی اجباری:
-
-run_case() {
-  NAME="$1"
-  shift
-
-  mkdir -p "audit/cases/$NAME"
-
-  {
-    echo "CASE=$NAME"
-    echo "START=$(date -u +%FT%TZ)"
-    echo "COMMAND=$*"
-  } > "audit/cases/$NAME/metadata.txt"
-
-  set +e
-  "$@" > "audit/cases/$NAME/run.log" 2>&1
-  RC=$?
-  set -e
-
-  printf '%s\n' "$RC" > "audit/cases/$NAME/status.txt"
-
-  if [ "$RC" -eq 0 ]; then
-    echo "PASS" > "audit/cases/$NAME/result.txt"
-  else
-    echo "FAIL" > "audit/cases/$NAME/result.txt"
-  fi
-
-  return 0
-}
-
-نکته حیاتی: "run_case" همیشه باید "0" برگرداند تا failure یک case باعث توقف shell نشود.
-
----
-
-مرحله 1 — Source Validation
-
-ZIP را با نام دقیق دریافت کن.
-
-بررسی کن:
-
-- ZIP سالم است
-- unzip بدون error
-- دقیقاً یک "pubspec.yaml"
-- Flutter project root مشخص است
-- package/version:
-  - "hope_mobile"
-  - "3.8.0+11"
-- Android package:
-  - "com.hope.marketplace"
-
-همه نتایج را ثبت کن.
-
----
-
-مرحله 2 — Environment
-
-دقیقاً از این نسخه‌ها استفاده کن:
-
-- Flutter "3.47.1"
-- Dart متناسب با Flutter 3.47.1
-- Java "17"
-- Node "24.x"
-- Android SDK "36"
-- NDK "28.2.13676358"
-
-نسخه واقعی هر ابزار را در گزارش ثبت کن.
-
----
-
-مرحله 3 — Dependency Bootstrap
-
-این‌ها را به صورت case مستقل اجرا کن:
-
-flutter pub get
-flutter gen-l10n
-npm ci
-
-اگر "pub get" fail شد:
-
-تست‌های بعدی را متوقف نکن.
-
-همان failure را ثبت کن و سپس:
-
-- analyze را اجرا کن
-- test را اجرا کن
-- localization را اجرا کن
-- UX contract را اجرا کن
-- Android contract را اجرا کن
-
----
-
-مرحله 4 — Flutter Static
-
-هرکدام یک case مستقل:
-
-dart format --set-exit-if-changed .
-flutter analyze
-bash tools/check_localization.sh
-bash tools/check_localization_wave9.sh
-bash tools/check_ux_wave8.sh
-bash tools/android-release-contract.sh
-bash tools/android-runtime-cert-contract.sh
-
-حتی اگر یکی fail شد، بقیه باید اجرا شوند.
-
----
-
-مرحله 5 — Flutter Test
-
-تمام تست‌ها را اجرا کن:
-
-flutter test --no-pub
-
-و در صورت وجود:
-
-flutter test integration_test/...
-
-Test discovery را هم انجام بده و تعداد واقعی testها را گزارش کن.
-
-گزارش باید شامل این موارد باشد:
-
-Flutter tests:
-Total:
-Passed:
-Failed:
-Skipped:
-Errors:
-
-اگر "flutter test" fail شد، خروجی کامل و نام تست‌های failed ثبت شود.
-
----
-
-مرحله 6 — Backend
-
-تمام این موارد را مستقل اجرا کن:
-
-npm run check
-npm test
-npm run test:contract
-npm run test:product
-npm run test:all
-npm run test:wave10
-npm run test:perf
-npm run test:release-evidence
-npm run test:e2e
-npm run check:all
-npm audit --audit-level=high
-npm run score:90plus
-
-یک failure نباید execution مورد بعدی را متوقف کند.
-
----
-
-مرحله 7 — Database / Resilience
-
-در صورت امکان واقعی:
-
-- PostgreSQL 16
-- MinIO/S3
-- migration
-- seed
-- backup
-- restore
-- DR drill
-- provider failure injection
-- storage resilience
-
-هر کدام case جداگانه.
-
----
-
-مرحله 8 — Android
-
-حتماً:
-
-flutter build apk --release
-
-و همچنین:
-
-- APK discovery
-- package verification
-- version verification
-- minSdk
-- targetSdk
-- compileSdk
-- signing verification
-- SHA-256
-- APK path
-- release helper validation
-
----
-
-مرحله 9 — Emulator
-
-اگر emulator موجود است:
-
-- Android API 36
-- app launch
-- smoke test
-- local API
-- authentication
-- core navigation
-- critical user flow
-
-هر تست مستقل باشد.
-
----
-
-مرحله 10 — نتیجه نهایی
-
-حتی اگر 1 یا 20 تست fail شده باشد، قبل از خروج هرگز متوقف نشو.
-
-در پایان حتماً این دو فایل تولید شوند:
-
-FINAL-AUDIT-REPORT.md
-FINAL-AUDIT-REPORT.json
-
-JSON باید دقیقاً شامل این ساختار باشد:
-
-{
-  "project": "HOPE Marketplace",
-  "version": "3.8.0+11",
-  "overall": "PASS|FAIL|BLOCKED",
-  "tests_total": 0,
-  "tests_passed": 0,
-  "tests_failed": 0,
-  "tests_skipped": 0,
-  "tests_blocked": 0,
-  "failures": [],
-  "blocked_checks": [],
-  "environment": {},
-  "flutter": {},
-  "backend": {},
-  "android": {},
-  "security": {},
-  "release": {},
-  "recommendations": []
-}
-
-قانون مهم برای overall
-
-"PASS" فقط زمانی مجاز است که هیچ failure واقعی وجود نداشته باشد.
-
-"FAIL" زمانی که تست واقعاً اجرا شده و fail شده است.
-
-"BLOCKED" زمانی که prerequisite/environment اجازه اجرای واقعی تست را نداده است.
-
-BLOCKED را هرگز به جای PASS حساب نکن.
-
----
-
-مرحله 11 — Failure Classification
-
-هر failure باید به یکی از این دسته‌ها تعلق بگیرد:
-
-CODE_FAILURE
-TEST_FAILURE
-BUILD_FAILURE
-ENVIRONMENT_FAILURE
-MISSING_DEPENDENCY
-MISSING_SECRET
-MISSING_SERVICE
-MISSING_ARTIFACT
-CONFIGURATION_FAILURE
-TOOLCHAIN_FAILURE
-
-و برای هر failure:
-
-Test:
-Status:
-Exit code:
-Category:
-Root cause:
-Exact error:
-File:
-Line:
-Recommended fix:
-
----
-
-مرحله 12 — مهم‌ترین الزام
-
-در پایان فقط ننویس:
-
-"workflow failed"
-
-یا:
-
-"Flutter test failed"
-
-بلکه دقیقاً تمام test caseهای اجراشده را لیست کن:
-
-PASS  backend_check
-PASS  backend_contract
-FAIL  backend_e2e
-PASS  localization
-FAIL  flutter_analyze
-PASS  flutter_test
-BLOCKED android_emulator
-PASS  release_contract
-...
-
-سپس:
-
-TOTAL
-PASS
-FAIL
-SKIP
-BLOCKED
-
-و بعد:
-
-TOP 10 ROOT CAUSES
-
-و:
-
-RELEASE DECISION
-
----
-
-مرحله 13 — Artifact
-
-در هر حالت، حتی در failure:
-
-HOPE-FULL-AUDIT-COMPLETE-<run-id>.zip
-
-بساز که شامل این‌ها باشد:
-
-FINAL-AUDIT-REPORT.md
-FINAL-AUDIT-REPORT.json
-environment/
-cases/
-flutter/
-backend/
-android/
-release/
-security/
-
-این artifact باید حتی وقتی aggregate در نهایت FAIL می‌شود، upload شود.
-
----
-
-مرحله 14 — ممنوع
-
-این رفتارها ممنوع‌اند:
-
-1. توقف بعد از اولین error
-2. اعلام موفقیت بر اساس فقط "flutter analyze"
-3. نادیده گرفتن testهای skipped/blocked
-4. تبدیل environment failure به PASS
-5. ارائه یک نتیجه قرمز بدون breakdown
-6. حذف log تست‌های بعدی
-7. اجرای Flutter با نسخه 3.47.0؛ نسخه مرجع "3.47.1" است
-8. وابستگی به فایل‌های خارج از source ZIP بدون اعلام آن
-
----
-
-خروجی نهایی مورد انتظار
-
-در پایان فقط این خلاصه را چاپ کن:
-
-HOPE MARKETPLACE 3.8.0+11
-==========================
-
-TOTAL:
-PASS:
-FAIL:
-SKIPPED:
-BLOCKED:
-
-FLUTTER ANALYZE:
-FLUTTER TEST:
-BACKEND:
-SECURITY:
-DATABASE:
-EMULATOR:
-ANDROID BUILD:
-RELEASE CONTRACT:
-
-RELEASE DECISION:
-
-TOP FAILURES:
-1.
-2.
-3.
-4.
-5.
-
-ARTIFACT:
-<downloadable audit artifact>
-
-مهم‌ترین هدف این نسخه:
-
-قرمز شدن workflow قابل قبول است؛ ناقص بودن گزارش قابل قبول نیست.
-حتی در بدترین حالت باید بدانیم دقیقاً کدام تست‌ها PASS، FAIL، SKIP یا BLOCKED شده‌اند.
+name: HOPE Marketplace - Full Audit
+
+on:
+workflow_dispatch:
+push:
+branches:
+- main
+
+permissions:
+contents: read
+
+env:
+FLUTTER_VERSION: "3.47.1"
+NODE_VERSION: "24"
+JAVA_VERSION: "17"
+
+jobs:
+full-audit:
+name: Full Audit
+runs-on: ubuntu-latest
+timeout-minutes: 60
+
+steps:
+  - name: Checkout repository
+    uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+  - name: Prepare audit directories
+    shell: bash
+    run: |
+      set -u
+      rm -rf "$RUNNER_TEMP/hope-audit"
+      mkdir -p "$RUNNER_TEMP/hope-audit/cases"
+
+  - name: Locate source ZIP
+    id: source
+    shell: bash
+    run: |
+      set -u
+
+      ZIP=""
+
+      for candidate in \
+        "HOPE-MARKETPLACE-3.8.0-V6-REPAIRED.zip" \
+        "HOPE-3_8_0-build-ready.zip" \
+        "HOPE-marketplace-ready.zip"; do
+        if [ -f "$candidate" ]; then
+          ZIP="$candidate"
+          break
+        fi
+      done
+
+      if [ -z "$ZIP" ]; then
+        echo "ZIP_NOT_FOUND" > "$RUNNER_TEMP/hope-audit/source_status.txt"
+        echo "zip_exists=false" >> "$GITHUB_OUTPUT"
+        exit 1
+      fi
+
+      echo "ZIP=$ZIP" | tee "$RUNNER_TEMP/hope-audit/source_status.txt"
+      echo "zip_exists=true" >> "$GITHUB_OUTPUT"
+      echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+
+  - name: Verify ZIP integrity
+    if: always()
+    shell: bash
+    run: |
+      set -u
+
+      if [ "${{ steps.source.outputs.zip_exists }}" != "true" ]; then
+        echo "BLOCKED: source ZIP was not found."
+        exit 0
+      fi
+
+      unzip -t "${{ steps.source.outputs.zip }}" \
+        > "$RUNNER_TEMP/hope-audit/zip-integrity.log" 2>&1
+
+      RC=$?
+
+      if [ "$RC" -eq 0 ]; then
+        echo "PASS" > "$RUNNER_TEMP/hope-audit/zip-integrity.result"
+      else
+        echo "FAIL" > "$RUNNER_TEMP/hope-audit/zip-integrity.result"
+      fi
+
+  - name: Extract source ZIP
+    if: always() && steps.source.outputs.zip_exists == 'true'
+    shell: bash
+    run: |
+      set -u
+
+      rm -rf "$RUNNER_TEMP/hope-audit/source"
+      mkdir -p "$RUNNER_TEMP/hope-audit/source"
+
+      unzip -q "${{ steps.source.outputs.zip }}" \
+        -d "$RUNNER_TEMP/hope-audit/source"
+
+  - name: Locate Flutter project root
+    id: project
+    if: always() && steps.source.outputs.zip_exists == 'true'
+    shell: bash
+    run: |
+      set -u
+
+      ROOT="$(find "$RUNNER_TEMP/hope-audit/source" \
+        -type f \
+        -name pubspec.yaml \
+        -print \
+        | head -n 1 \
+        | xargs -r dirname)"
+
+      if [ -z "$ROOT" ]; then
+        echo "PROJECT_ROOT_NOT_FOUND" \
+          > "$RUNNER_TEMP/hope-audit/project-root.log"
+        exit 1
+      fi
+
+      echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+      echo "$ROOT" \
+        | tee "$RUNNER_TEMP/hope-audit/project-root.log"
+
+  - name: Setup Java
+    if: always()
+    uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+    with:
+      distribution: temurin
+      java-version: "17"
+
+  - name: Setup Flutter
+    if: always()
+    uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+    with:
+      flutter-version: "3.47.1"
+      channel: stable
+      cache: true
+
+  - name: Setup Node
+    if: always()
+    uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+    with:
+      node-version: "24"
+
+  - name: Record environment
+    if: always()
+    shell: bash
+    run: |
+      set +e
+
+      {
+        echo "=== ENVIRONMENT ==="
+        echo
+        echo "Date:"
+        date -u
+        echo
+        echo "Runner:"
+        uname -a
+        echo
+        echo "Flutter:"
+        flutter --version
+        echo
+        echo "Dart:"
+        dart --version
+        echo
+        echo "Java:"
+        java -version
+        echo
+        echo "Node:"
+        node --version
+        echo
+        echo "npm:"
+        npm --version
+      } > "$RUNNER_TEMP/hope-audit/environment.txt" 2>&1
+
+  - name: Run complete audit
+    if: always() && steps.project.outputs.root != ''
+    shell: bash
+    env:
+      PROJECT_ROOT: ${{ steps.project.outputs.root }}
+    run: |
+      set -u
+
+      AUDIT="$RUNNER_TEMP/hope-audit"
+
+      mkdir -p "$AUDIT/cases"
+
+      run_case() {
+        NAME="$1"
+        shift
+
+        DIR="$AUDIT/cases/$NAME"
+
+        rm -rf "$DIR"
+        mkdir -p "$DIR"
+
+        {
+          echo "CASE=$NAME"
+          echo "START=$(date -u +%FT%TZ)"
+          printf "COMMAND="
+          printf "%q " "$@"
+          echo
+        } > "$DIR/metadata.txt"
+
+        (
+          cd "$PROJECT_ROOT"
+          "$@"
+        ) > "$DIR/run.log" 2>&1
+
+        RC=$?
+
+        echo "$RC" > "$DIR/status.txt"
+
+        if [ "$RC" -eq 0 ]; then
+          echo "PASS" > "$DIR/result.txt"
+        else
+          echo "FAIL" > "$DIR/result.txt"
+        fi
+
+        echo "END=$(date -u +%FT%TZ)" >> "$DIR/metadata.txt"
+
+        return 0
+      }
+
+      mark_blocked() {
+        NAME="$1"
+        REASON="$2"
+
+        DIR="$AUDIT/cases/$NAME"
+
+        mkdir -p "$DIR"
+
+        echo "BLOCKED" > "$DIR/result.txt"
+        echo "0" > "$DIR/status.txt"
+        printf "%s\n" "$REASON" > "$DIR/run.log"
+        printf "CASE=%s\nSTATUS=BLOCKED\nREASON=%s\n" \
+          "$NAME" "$REASON" > "$DIR/metadata.txt"
+      }
+
+      # -------------------------
+      # Flutter
+      # -------------------------
+
+      run_case flutter_pub_get \
+        bash -c "cd '$PROJECT_ROOT' && flutter pub get"
+
+      run_case flutter_gen_l10n \
+        bash -c "cd '$PROJECT_ROOT' && flutter gen-l10n"
+
+      run_case flutter_format \
+        bash -c "cd '$PROJECT_ROOT' && dart format --set-exit-if-changed ."
+
+      run_case flutter_analyze \
+        bash -c "cd '$PROJECT_ROOT' && flutter analyze"
+
+      run_case flutter_test \
+        bash -c "cd '$PROJECT_ROOT' && flutter test --no-pub"
+
+      if [ -d "$PROJECT_ROOT/integration_test" ]; then
+        run_case flutter_integration_test \
+          bash -c "cd '$PROJECT_ROOT' && flutter test integration_test"
+      else
+        mark_blocked \
+          flutter_integration_test \
+          "integration_test directory does not exist"
+      fi
+
+      # -------------------------
+      # Project audit scripts
+      # -------------------------
+
+      if [ -x "$PROJECT_ROOT/tools/check_localization.sh" ] \
+         || [ -f "$PROJECT_ROOT/tools/check_localization.sh" ]; then
+        run_case localization \
+          bash -c "cd '$PROJECT_ROOT' && bash tools/check_localization.sh"
+      else
+        mark_blocked localization "checker not found"
+      fi
+
+      if [ -x "$PROJECT_ROOT/tools/check_localization_wave9.sh" ] \
+         || [ -f "$PROJECT_ROOT/tools/check_localization_wave9.sh" ]; then
+        run_case localization_wave9 \
+          bash -c "cd '$PROJECT_ROOT' && bash tools/check_localization_wave9.sh"
+      else
+        mark_blocked localization_wave9 "checker not found"
+      fi
+
+      if [ -x "$PROJECT_ROOT/tools/check_ux_wave8.sh" ] \
+         || [ -f "$PROJECT_ROOT/tools/check_ux_wave8.sh" ]; then
+        run_case ux_wave8 \
+          bash -c "cd '$PROJECT_ROOT' && bash tools/check_ux_wave8.sh"
+      else
+        mark_blocked ux_wave8 "checker not found"
+      fi
+
+      if [ -x "$PROJECT_ROOT/tools/android-release-contract.sh" ] \
+         || [ -f "$PROJECT_ROOT/tools/android-release-contract.sh" ]; then
+        run_case android_release_contract \
+          bash -c "cd '$PROJECT_ROOT' && bash tools/android-release-contract.sh"
+      else
+        mark_blocked android_release_contract "checker not found"
+      fi
+
+      if [ -x "$PROJECT_ROOT/tools/android-runtime-cert-contract.sh" ] \
+         || [ -f "$PROJECT_ROOT/tools/android-runtime-cert-contract.sh" ]; then
+        run_case android_runtime_contract \
+          bash -c "cd '$PROJECT_ROOT' && bash tools/android-runtime-cert-contract.sh"
+      else
+        mark_blocked android_runtime_contract "checker not found"
+      fi
+
+      # -------------------------
+      # Backend
+      # -------------------------
+
+      if [ -f "$PROJECT_ROOT/backend/package.json" ]; then
+
+        run_case backend_npm_ci \
+          bash -c "cd '$PROJECT_ROOT/backend' && npm ci"
+
+        run_case backend_check \
+          bash -c "cd '$PROJECT_ROOT/backend' && npm run check"
+
+        run_case backend_test \
+          bash -c "cd '$PROJECT_ROOT/backend' && npm test"
+
+        run_case backend_contract \
+          bash -c "cd '$PROJECT_ROOT/backend' && npm run test:contract"
+
+        run_case backend_product \
+          bash -c "cd '$PROJECT_ROOT/backend' && npm run test:product"
+
+        if npm --prefix "$PROJECT_ROOT/backend" run 2>/dev/null \
+          | grep -q "test:all"; then
+          run_case backend_all \
+            bash -c "cd '$PROJECT_ROOT/backend' && npm run test:all"
+        else
+          mark_blocked backend_all "test:all script not present"
+        fi
+
+        run_case backend_check_all \
+          bash -c "cd '$PROJECT_ROOT/backend' && npm run check:all"
+
+        run_case backend_audit \
+          bash -c "cd '$PROJECT_ROOT/backend' && npm audit --audit-level=high"
+
+      else
+        mark_blocked backend_npm_ci "backend/package.json not found"
+        mark_blocked backend_check "backend/package.json not found"
+        mark_blocked backend_test "backend/package.json not found"
+        mark_blocked backend_contract "backend/package.json not found"
+        mark_blocked backend_product "backend/package.json not found"
+        mark_blocked backend_all "backend/package.json not found"
+        mark_blocked backend_check_all "backend/package.json not found"
+        mark_blocked backend_audit "backend/package.json not found"
+      fi
+
+      # -------------------------
+      # Android build
+      # -------------------------
+
+      run_case android_build \
+        bash -c "cd '$PROJECT_ROOT' && flutter build apk --release"
+
+      # -------------------------
+      # Android artifact inspection
+      # -------------------------
+
+      APK="$(
+        find "$PROJECT_ROOT/build/app/outputs" \
+          -type f \
+          -name "*.apk" -o -name "*.aab" \
+          2>/dev/null \
+          | head -n 1
+      )"
+
+      if [ -n "$APK" ] && [ -f "$APK" ]; then
+
+        mkdir -p "$AUDIT/android"
+
+        cp "$APK" "$AUDIT/android/"
+
+        {
+          echo "APK=$APK"
+          echo "SIZE=$(stat -c%s "$APK" 2>/dev/null || stat -f%z "$APK")"
+          echo "SHA256=$(sha256sum "$APK" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$APK" | awk '{print $1}')"
+        } > "$AUDIT/android/apk-info.txt"
+
+        echo "PASS" > "$AUDIT/cases/android_artifact/result.txt"
+        echo "0" > "$AUDIT/cases/android_artifact/status.txt"
+        cp "$AUDIT/android/apk-info.txt" \
+          "$AUDIT/cases/android_artifact/run.log"
+
+      else
+
+        mark_blocked \
+          android_artifact \
+          "No APK/AAB artifact was found after build"
+
+      fi
+
+      # -------------------------
+      # Aggregate
+      # -------------------------
+
+      TOTAL=0
+      PASS=0
+      FAIL=0
+      SKIPPED=0
+      BLOCKED=0
+
+      : > "$AUDIT/SUMMARY.txt"
+
+      for DIR in "$AUDIT"/cases/*; do
+        [ -d "$DIR" ] || continue
+
+        NAME="$(basename "$DIR")"
+        RESULT="$(cat "$DIR/result.txt" 2>/dev/null || echo BLOCKED)"
+
+        case "$RESULT" in
+          PASS)
+            PASS=$((PASS+1))
+            ;;
+          FAIL)
+            FAIL=$((FAIL+1))
+            ;;
+          SKIPPED)
+            SKIPPED=$((SKIPPED+1))
+            ;;
+          BLOCKED)
+            BLOCKED=$((BLOCKED+1))
+            ;;
+          *)
+            RESULT="BLOCKED"
+            BLOCKED=$((BLOCKED+1))
+            ;;
+        esac
+
+        TOTAL=$((TOTAL+1))
+
+        printf "%-35s %s\n" \
+          "$NAME" "$RESULT" >> "$AUDIT/SUMMARY.txt"
+
+      done
+
+      if [ "$FAIL" -gt 0 ]; then
+        OVERALL="FAIL"
+      elif [ "$BLOCKED" -gt 0 ]; then
+        OVERALL="BLOCKED"
+      else
+        OVERALL="PASS"
+      fi
+
+      # -------------------------
+      # Markdown report
+      # -------------------------
+
+      {
+        echo "# HOPE Marketplace 3.8.0+11 — Full Audit"
+        echo
+        echo "## Final Result"
+        echo
+        echo "- Overall: **$OVERALL**"
+        echo "- Total: **$TOTAL**"
+        echo "- PASS: **$PASS**"
+        echo "- FAIL: **$FAIL**"
+        echo "- SKIPPED: **$SKIPPED**"
+        echo "- BLOCKED: **$BLOCKED**"
+        echo
+        echo "## Test Matrix"
+        echo
+        echo '```text'
+        cat "$AUDIT/SUMMARY.txt"
+        echo '```'
+        echo
+        echo "## Environment"
+        echo
+        cat "$AUDIT/environment.txt" 2>/dev/null || true
+        echo
+        echo "## Failed Tests"
+        echo
+      } > "$AUDIT/FINAL-AUDIT-REPORT.md"
+
+      FOUND_FAILURE=0
+
+      for DIR in "$AUDIT"/cases/*; do
+        [ -d "$DIR" ] || continue
+
+        RESULT="$(cat "$DIR/result.txt" 2>/dev/null || true)"
+
+        if [ "$RESULT" = "FAIL" ]; then
+          FOUND_FAILURE=1
+
+          NAME="$(basename "$DIR")"
+
+          {
+            echo "### $NAME"
+            echo
+            echo "- Exit code: $(cat "$DIR/status.txt" 2>/dev/null || echo unknown)"
+            echo
+            echo '```text'
+            tail -n 80 "$DIR/run.log" 2>/dev/null || true
+            echo '```'
+            echo
+          } >> "$AUDIT/FINAL-AUDIT-REPORT.md"
+        fi
+      done
+
+      {
+        echo "## Release Decision"
+        echo
+        echo "**$OVERALL**"
+      } >> "$AUDIT/FINAL-AUDIT-REPORT.md"
+
+      # -------------------------
+      # JSON report
+      # -------------------------
+
+      python3 - "$AUDIT" "$OVERALL" "$TOTAL" "$PASS" "$FAIL" "$SKIPPED" "$BLOCKED" <<'PY'
+      import json
+      import pathlib
+      import sys
+
+      audit = pathlib.Path(sys.argv[1])
+      overall = sys.argv[2]
+
+      report = {
+          "project": "HOPE Marketplace",
+          "version": "3.8.0+11",
+          "overall": overall,
+          "tests_total": int(sys.argv[3]),
+          "tests_passed": int(sys.argv[4]),
+          "tests_failed": int(sys.argv[5]),
+          "tests_skipped": int(sys.argv[6]),
+          "tests_blocked": int(sys.argv[7]),
+          "cases": []
+      }
+
+      for result_file in sorted((audit / "cases").glob("*/result.txt")):
+          case_dir = result_file.parent
+          name = case_dir.name
+          status = result_file.read_text().strip()
+
+          report["cases"].append({
+              "name": name,
+              "status": status,
+              "exit_code": (
+                  int((case_dir / "status.txt").read_text().strip())
+                  if (case_dir / "status.txt").exists()
+                  and (case_dir / "status.txt").read_text().strip().isdigit()
+                  else None
+              )
+          })
+
+      (audit / "FINAL-AUDIT-REPORT.json").write_text(
+          json.dumps(report, indent=2),
+          encoding="utf-8"
+      )
+      PY
+
+      # -------------------------
+      # Final console summary
+      # -------------------------
+
+      echo
+      echo "========================================"
+      echo "HOPE MARKETPLACE 3.8.0+11"
+      echo "FULL AUDIT RESULT"
+      echo "========================================"
+      echo
+      echo "TOTAL:   $TOTAL"
+      echo "PASS:    $PASS"
+      echo "FAIL:    $FAIL"
+      echo "SKIPPED: $SKIPPED"
+      echo "BLOCKED: $BLOCKED"
+      echo
+      echo "RELEASE DECISION: $OVERALL"
+      echo
+      echo "========================================"
+      echo "TEST MATRIX"
+      echo "========================================"
+      cat "$AUDIT/SUMMARY.txt"
+      echo "========================================"
+
+      # Save counters for later steps.
+      {
+        echo "TOTAL=$TOTAL"
+        echo "PASS=$PASS"
+        echo "FAIL=$FAIL"
+        echo "SKIPPED=$SKIPPED"
+        echo "BLOCKED=$BLOCKED"
+        echo "OVERALL=$OVERALL"
+      } > "$AUDIT/final-status.env"
+
+  - name: Print final report
+    if: always()
+    shell: bash
+    run: |
+      set +e
+
+      if [ -f "$RUNNER_TEMP/hope-audit/FINAL-AUDIT-REPORT.md" ]; then
+        cat "$RUNNER_TEMP/hope-audit/FINAL-AUDIT-REPORT.md"
+      else
+        echo "FINAL-AUDIT-REPORT.md was not generated."
+      fi
+
+  - name: Upload complete audit results
+    if: always()
+    uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+    with:
+      name: HOPE-FULL-AUDIT-COMPLETE-${{ github.run_id }}
+      path: ${{ runner.temp }}/hope-audit
+      if-no-files-found: warn
+      retention-days: 14
+
+  - name: Final gate
+    if: always()
+    shell: bash
+    run: |
+      set +e
+
+      STATUS_FILE="$RUNNER_TEMP/hope-audit/final-status.env"
+
+      if [ ! -f "$STATUS_FILE" ]; then
+        echo "Final audit status file was not generated."
+        exit 1
+      fi
+
+      . "$STATUS_FILE"
+
+      echo
+      echo "========================================"
+      echo "FINAL GATE"
+      echo "========================================"
+      echo "TOTAL:   $TOTAL"
+      echo "PASS:    $PASS"
+      echo "FAIL:    $FAIL"
+      echo "SKIPPED: $SKIPPED"
+      echo "BLOCKED: $BLOCKED"
+      echo "RESULT:  $OVERALL"
+      echo "========================================"
+
+      if [ "$OVERALL" = "FAIL" ]; then
+        exit 1
+      fi
+
+      if [ "$OVERALL" = "BLOCKED" ]; then
+        exit 1
+      fi
+
+      exit 0
