@@ -1,0 +1,1799 @@
+name: HOPE Auto Repair → Pilot Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_bundle:
+        description: "HOPE repair bundle ZIP"
+        required: false
+        default: "HOPE-FINAL-REPAIR-BUNDLE-1.zip"
+        type: string
+
+      max_repair_rounds:
+        description: "Maximum AI repair rounds"
+        required: false
+        default: "5"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+          - "5"
+          - "6"
+
+      push_repaired_commit:
+        description: "Commit repaired source back to repository"
+        required: false
+        default: false
+        type: boolean
+
+      create_pull_request:
+        description: "Create a Pull Request with repaired source"
+        required: false
+        default: true
+        type: boolean
+
+env:
+  FLUTTER_VERSION: "3.47.1"
+  JAVA_VERSION: "17"
+  NODE_VERSION: "24"
+  ANDROID_API: "36"
+  ANDROID_BUILD_TOOLS: "36.0.0"
+  ANDROID_NDK: "28.2.13676358"
+
+  SOURCE_BUNDLE_INPUT: ${{ inputs.source_bundle }}
+  MAX_REPAIR_ROUNDS: ${{ inputs.max_repair_rounds }}
+
+  # Optional model names.
+  OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-5' }}
+  ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-sonnet-4-5' }}
+  GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.7-flash' }}
+
+  CI: "true"
+  NO_COLOR: "1"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+
+  prepare:
+    name: Prepare CI + Extract Bundle + Build Evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    outputs:
+      flutter_root: ${{ steps.detect.outputs.flutter_root }}
+      backend_root: ${{ steps.detect.outputs.backend_root }}
+      source_dir: ${{ steps.detect.outputs.source_dir }}
+      bundle_name: ${{ steps.bundle.outputs.bundle_name }}
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Prepare workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf repair-work
+          mkdir -p repair-work
+          mkdir -p repair-work/evidence
+          mkdir -p repair-work/source
+          mkdir -p repair-work/ai
+          mkdir -p repair-work/patches
+          mkdir -p repair-work/results
+
+          echo "Repository: $GITHUB_REPOSITORY" \
+            | tee repair-work/evidence/run.txt
+
+          echo "Commit: $GITHUB_SHA" \
+            | tee -a repair-work/evidence/run.txt
+
+          echo "Run: $GITHUB_RUN_ID" \
+            | tee -a repair-work/evidence/run.txt
+
+          echo "UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            | tee -a repair-work/evidence/run.txt
+
+      - name: Locate source bundle
+        id: bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          requested="${SOURCE_BUNDLE_INPUT:-HOPE-FINAL-REPAIR-BUNDLE-1.zip}"
+
+          candidates=(
+            "$requested"
+            "HOPE-FINAL-REPAIR-BUNDLE-1.zip"
+            "HOPE-FINAL-REPAIR-BUNDLE.zip"
+          )
+
+          found=""
+
+          for candidate in "${candidates[@]}"; do
+            if [ -f "$candidate" ]; then
+              found="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$found" ]; then
+            found="$(find . -maxdepth 5 -type f \
+              \( -name 'HOPE-FINAL-REPAIR-BUNDLE-1.zip' \
+              -o -name 'HOPE-FINAL-REPAIR-BUNDLE.zip' \) \
+              -print -quit || true)"
+          fi
+
+          if [ -z "$found" ]; then
+            echo "ERROR: HOPE repair bundle not found."
+            exit 1
+          fi
+
+          cp "$found" repair-work/"$(basename "$found")"
+
+          sha256sum "$found" \
+            | tee repair-work/evidence/source-bundle.sha256
+
+          unzip -t "$found" \
+            > repair-work/evidence/bundle-integrity.log 2>&1
+
+          echo "bundle_name=$(basename "$found")" >> "$GITHUB_OUTPUT"
+
+          echo "BUNDLE=$found" \
+            | tee repair-work/evidence/bundle.txt
+
+      - name: Extract Bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUNDLE="$(cat repair-work/evidence/bundle.txt \
+            | sed 's/^BUNDLE=//')"
+
+          rm -rf repair-work/bundle
+          mkdir -p repair-work/bundle
+
+          unzip -q "$BUNDLE" -d repair-work/bundle
+
+          find repair-work/bundle -maxdepth 4 -type f \
+            | sort \
+            > repair-work/evidence/bundle-tree.txt
+
+      - name: Select source ZIP from bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p repair-work/nested-source
+
+          source_zip="$(
+            find repair-work/bundle \
+              -type f \
+              \( \
+                -name 'HOPE-MARKETPLACE-3.8.0-V6-REPAIRED-FINAL.zip' \
+                -o -name 'HOPE-MARKETPLACE-3.8.0-V6-REPAIRED.zip' \
+                -o -name '*HOPE*3.8.0*REPAIRED*.zip' \
+              \) \
+              -print \
+              | head -n 1
+          )"
+
+          if [ -z "$source_zip" ]; then
+            source_zip="$(
+              find repair-work/bundle \
+                -type f -name '*.zip' \
+                ! -name '*BUNDLE*.zip' \
+                -print \
+                | head -n 1
+            )"
+          fi
+
+          if [ -z "$source_zip" ]; then
+            echo "ERROR: Source project ZIP was not found inside the bundle."
+            exit 1
+          fi
+
+          echo "$source_zip" \
+            | tee repair-work/evidence/source-project-zip.txt
+
+          unzip -q "$source_zip" -d repair-work/nested-source
+
+      - name: Detect Flutter + Backend roots
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FLUTTER_ROOT="$(
+            find repair-work/nested-source \
+              -type f \
+              -name pubspec.yaml \
+              -print \
+              | while read -r f; do
+                  d="$(dirname "$f")"
+                  if [ -d "$d/android" ]; then
+                    echo "$d"
+                    break
+                  fi
+                done
+          )"
+
+          if [ -z "$FLUTTER_ROOT" ]; then
+            FLUTTER_ROOT="$(
+              find repair-work/nested-source \
+                -type f \
+                -name pubspec.yaml \
+                -print \
+                | head -n 1 \
+                | xargs -r dirname
+            )"
+          fi
+
+          if [ -z "$FLUTTER_ROOT" ]; then
+            echo "ERROR: Flutter root not detected."
+            exit 1
+          fi
+
+          FLUTTER_ROOT="$(cd "$FLUTTER_ROOT" && pwd)"
+
+          BACKEND_ROOT=""
+
+          if [ -f "$FLUTTER_ROOT/backend/package.json" ]; then
+            BACKEND_ROOT="$FLUTTER_ROOT/backend"
+          else
+            BACKEND_ROOT="$(
+              find "$FLUTTER_ROOT" \
+                -type f \
+                -name package.json \
+                -print \
+                | head -n 1 \
+                | xargs -r dirname
+            )"
+          fi
+
+          BACKEND_ROOT="${BACKEND_ROOT:-}"
+
+          echo "flutter_root=$FLUTTER_ROOT" \
+            >> "$GITHUB_OUTPUT"
+
+          echo "backend_root=$BACKEND_ROOT" \
+            >> "$GITHUB_OUTPUT"
+
+          echo "source_dir=$FLUTTER_ROOT" \
+            >> "$GITHUB_OUTPUT"
+
+          echo "$FLUTTER_ROOT" \
+            > repair-work/evidence/FLUTTER_ROOT.txt
+
+          echo "$BACKEND_ROOT" \
+            > repair-work/evidence/BACKEND_ROOT.txt
+
+      - name: Capture baseline repository state
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$(cat repair-work/evidence/FLUTTER_ROOT.txt)"
+
+          cd "$ROOT"
+
+          {
+            echo "=== PUBSPEC ==="
+            sed -n '1,260p' pubspec.yaml
+
+            echo
+            echo "=== PUBSPEC LOCK ==="
+            if [ -f pubspec.lock ]; then
+              echo "PRESENT"
+              sha256sum pubspec.lock
+            else
+              echo "MISSING"
+            fi
+
+            echo
+            echo "=== GIT STATUS ==="
+            git status --short 2>/dev/null || true
+
+            echo
+            echo "=== ANDROID GRADLE ==="
+            sed -n '1,320p' android/app/build.gradle.kts 2>/dev/null || true
+
+            echo
+            echo "=== L10N DUPLICATES ==="
+            grep -n "copy_value_irr_ed45261" \
+              lib/core/ui/hope_l10n.dart 2>/dev/null || true
+
+          } > "$GITHUB_WORKSPACE/repair-work/evidence/baseline-project.txt"
+
+      - name: Install Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.1"
+          channel: stable
+          cache: true
+
+      - name: Prepare Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          yes | sdkmanager --licenses >/dev/null || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${ANDROID_NDK}"
+
+      - name: Capture toolchain
+        shell: bash
+        run: |
+          set +e
+
+          flutter --version \
+            > repair-work/evidence/flutter-version.log 2>&1
+
+          flutter doctor -v \
+            > repair-work/evidence/flutter-doctor.log 2>&1
+
+          java -version \
+            > repair-work/evidence/java-version.log 2>&1
+
+          node --version \
+            > repair-work/evidence/node-version.log 2>&1
+
+          npm --version \
+            > repair-work/evidence/npm-version.log 2>&1
+
+  repair:
+    name: Deterministic Repair + AI Assisted Repair
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Restore workspace from previous job
+        uses: actions/download-artifact@v6
+        continue-on-error: true
+        with:
+          name: hope-repair-workspace
+          path: repair-work
+
+      - name: Rebuild workspace if artifact is unavailable
+        if: ${{ !hashFiles('repair-work/evidence/FLUTTER_ROOT.txt') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p repair-work/evidence
+          mkdir -p repair-work/source
+          mkdir -p repair-work/ai
+          mkdir -p repair-work/patches
+          mkdir -p repair-work/results
+
+          requested="${SOURCE_BUNDLE_INPUT:-HOPE-FINAL-REPAIR-BUNDLE-1.zip}"
+
+          found=""
+
+          for candidate in \
+            "$requested" \
+            "HOPE-FINAL-REPAIR-BUNDLE-1.zip" \
+            "HOPE-FINAL-REPAIR-BUNDLE.zip"
+          do
+            if [ -f "$candidate" ]; then
+              found="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$found" ]; then
+            echo "Repair bundle not found."
+            exit 1
+          fi
+
+          rm -rf repair-work/bundle
+          rm -rf repair-work/nested-source
+
+          mkdir -p repair-work/bundle
+          mkdir -p repair-work/nested-source
+
+          unzip -q "$found" -d repair-work/bundle
+
+          source_zip="$(
+            find repair-work/bundle \
+              -type f \
+              \( \
+                -name 'HOPE-MARKETPLACE-3.8.0-V6-REPAIRED-FINAL.zip' \
+                -o -name 'HOPE-MARKETPLACE-3.8.0-V6-REPAIRED.zip' \
+                -o -name '*HOPE*3.8.0*REPAIRED*.zip' \
+              \) \
+              -print \
+              | head -n 1
+          )"
+
+          if [ -z "$source_zip" ]; then
+            source_zip="$(
+              find repair-work/bundle \
+                -type f -name '*.zip' \
+                ! -name '*BUNDLE*.zip' \
+                -print \
+                | head -n 1
+            )"
+          fi
+
+          unzip -q "$source_zip" \
+            -d repair-work/nested-source
+
+          ROOT="$(
+            find repair-work/nested-source \
+              -type f -name pubspec.yaml \
+              -print \
+              | while read -r f; do
+                  d="$(dirname "$f")"
+                  if [ -d "$d/android" ]; then
+                    echo "$d"
+                    break
+                  fi
+                done
+          )"
+
+          ROOT="$(cd "$ROOT" && pwd)"
+
+          echo "$ROOT" > repair-work/evidence/FLUTTER_ROOT.txt
+
+          if [ -f "$ROOT/backend/package.json" ]; then
+            echo "$ROOT/backend" \
+              > repair-work/evidence/BACKEND_ROOT.txt
+          else
+            find "$ROOT" \
+              -type f -name package.json \
+              -print \
+              | head -n 1 \
+              | xargs -r dirname \
+              > repair-work/evidence/BACKEND_ROOT.txt
+          fi
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Setup Flutter 3.47.1
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.1"
+          channel: stable
+          cache: true
+
+      - name: Install jq + utilities
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl unzip zip git ripgrep
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          yes | sdkmanager --licenses >/dev/null || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${ANDROID_NDK}"
+
+      - name: Inject latest audit intelligence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$(cat repair-work/evidence/FLUTTER_ROOT.txt)"
+          REPORT="repair-work/ai/latest-audit-context.md"
+
+          mkdir -p repair-work/ai
+
+          {
+            echo "# HOPE Repair Intelligence Context"
+            echo
+            echo "## Current repository"
+            echo "$GITHUB_REPOSITORY"
+            echo
+            echo "## Current commit"
+            echo "$GITHUB_SHA"
+            echo
+            echo "## Known historical findings"
+            echo
+            echo "- duplicate localization accessor:"
+            echo "  lib/core/ui/hope_l10n.dart"
+            echo
+            echo "- Flutter formatting failures"
+            echo
+            echo "- Flutter analyze/test failures"
+            echo
+            echo "- Android debug profile eagerly requiring production signing"
+            echo
+            echo "- Android production signing fail-closed requirement"
+            echo
+            echo "- Backend production environment fixture requirement"
+            echo
+            echo "- S3 integration requires MinIO-compatible endpoint"
+            echo
+            echo "- Security static scan requires manual-review classification"
+            echo
+            echo "## Current source evidence"
+            echo
+            find "$ROOT" \
+              -maxdepth 3 \
+              -type f \
+              | sort \
+              | head -n 4000
+          } > "$REPORT"
+
+          find repair-work/bundle \
+            -type f \
+            \( \
+              -name 'FINAL-AUDIT-REPORT.md' \
+              -o -name 'HOPE-FINAL-REPAIR-REPORT.md' \
+              -o -name 'CI_TEST_REPAIRS.md' \
+              -o -name '*.log' \
+              -o -name '*.status' \
+            \) \
+            -print \
+            -exec sh -c \
+              'echo; echo "===== $1 ====="; sed -n "1,500p" "$1"' \
+              _ {} \; \
+            >> "$REPORT" || true
+
+      - name: Apply deterministic known repairs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$(cat repair-work/evidence/FLUTTER_ROOT.txt)"
+
+          cd "$ROOT"
+
+          mkdir -p "$GITHUB_WORKSPACE/repair-work/patches/deterministic"
+
+          echo "=== DETERMINISTIC REPAIR START ===" \
+            | tee "$GITHUB_WORKSPACE/repair-work/patches/deterministic/README.txt"
+
+          # ------------------------------------------------------------
+          # 1. Remove duplicate localization accessor.
+          # ------------------------------------------------------------
+          L10N="lib/core/ui/hope_l10n.dart"
+
+          if [ -f "$L10N" ]; then
+
+            count="$(
+              grep -c \
+                "copy_value_irr_ed45261" \
+                "$L10N" || true
+            )"
+
+            if [ "$count" -gt 1 ]; then
+              awk '
+                /String copy_value_irr_ed45261/ {
+                  count++
+                  if (count > 1) next
+                }
+                { print }
+              ' "$L10N" > "$L10N.tmp"
+
+              mv "$L10N.tmp" "$L10N"
+
+              echo \
+                "Removed duplicate copy_value_irr_ed45261" \
+                >> "$GITHUB_WORKSPACE/repair-work/patches/deterministic/README.txt"
+            fi
+          fi
+
+          # ------------------------------------------------------------
+          # 2. Remove known unused dart:ui import.
+          # ------------------------------------------------------------
+          TELEMETRY="lib/core/telemetry/telemetry_service.dart"
+
+          if [ -f "$TELEMETRY" ]; then
+            sed -i \
+              "/^import 'dart:ui';$/d" \
+              "$TELEMETRY" || true
+          fi
+
+          # ------------------------------------------------------------
+          # 3. Make release profile lazy.
+          # Debug must not require production signing credentials.
+          # ------------------------------------------------------------
+          GRADLE="android/app/build.gradle.kts"
+
+          if [ -f "$GRADLE" ]; then
+
+            python3 - "$GRADLE" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text()
+
+old = '''val profile = System.getenv("BUILD_PROFILE")?.lowercase() ?: "production"'''
+
+new = '''val releaseRequested = gradle.startParameter.taskNames.any { task ->
+    task.contains("Release", ignoreCase = true)
+}
+val profile = System.getenv("BUILD_PROFILE")?.lowercase()
+    ?: if (releaseRequested) "production" else "pilot"'''
+
+if old in s and "val releaseRequested" not in s:
+    s = s.replace(old, new, 1)
+
+p.write_text(s)
+PY
+
+          fi
+
+          # ------------------------------------------------------------
+          # 4. Force staging debug workflow to pilot profile when present.
+          # ------------------------------------------------------------
+          find .github/workflows \
+            -type f \
+            \( -name '*.yml' -o -name '*.yaml' \) \
+            -print 2>/dev/null \
+            | while read -r wf; do
+
+              if grep -q \
+                "flutter build apk --debug" \
+                "$wf" 2>/dev/null; then
+
+                if ! grep -q \
+                  "BUILD_PROFILE=pilot" \
+                  "$wf" 2>/dev/null; then
+
+                  sed -i \
+                    's/flutter build apk --debug/BUILD_PROFILE=pilot flutter build apk --debug/g' \
+                    "$wf"
+                fi
+              fi
+            done || true
+
+          git diff \
+            > "$GITHUB_WORKSPACE/repair-work/patches/deterministic/deterministic.diff"
+
+      - name: Flutter dependency resolution
+        shell: bash
+        run: |
+          set +e
+
+          ROOT="$(cat repair-work/evidence/FLUTTER_ROOT.txt)"
+
+          cd "$ROOT"
+
+          flutter pub get \
+            > "$GITHUB_WORKSPACE/repair-work/results/flutter-pub-get.log" 2>&1
+
+          PUB_RC=$?
+
+          flutter gen-l10n \
+            > "$GITHUB_WORKSPACE/repair-work/results/flutter-gen-l10n.log" 2>&1
+
+          L10N_RC=$?
+
+          echo "PUB_GET_RC=$PUB_RC" \
+            >> "$GITHUB_WORKSPACE/repair-work/results/flutter-deps.summary"
+
+          echo "GEN_L10N_RC=$L10N_RC" \
+            >> "$GITHUB_WORKSPACE/repair-work/results/flutter-deps.summary"
+
+          exit 0
+
+      - name: Backend dependency installation
+        shell: bash
+        run: |
+          set +e
+
+          BACKEND="$(cat repair-work/evidence/BACKEND_ROOT.txt)"
+
+          if [ -z "$BACKEND" ] || [ ! -f "$BACKEND/package.json" ]; then
+            exit 0
+          fi
+
+          cd "$BACKEND"
+
+          if [ -f package-lock.json ]; then
+            npm ci \
+              > "$GITHUB_WORKSPACE/repair-work/results/backend-install.log" 2>&1
+          else
+            npm install \
+              > "$GITHUB_WORKSPACE/repair-work/results/backend-install.log" 2>&1
+          fi
+
+      - name: Start MinIO for S3 integration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker pull \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z
+
+          docker rm -f hope-minio >/dev/null 2>&1 || true
+
+          docker run -d \
+            --name hope-minio \
+            -p 9000:9000 \
+            -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z \
+            server /data \
+            --console-address ":9001"
+
+          for i in $(seq 1 30); do
+            if curl -fsS \
+              http://127.0.0.1:9000/minio/health/live \
+              >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+
+          curl -fsS \
+            http://127.0.0.1:9000/minio/health/live \
+            >/dev/null
+
+          {
+            echo "S3_ENDPOINT=http://127.0.0.1:9000"
+            echo "S3_BUCKET=hope-ci"
+            echo "S3_REGION=us-east-1"
+            echo "S3_ACCESS_KEY_ID=minioadmin"
+            echo "S3_SECRET_ACCESS_KEY=minioadmin"
+            echo "S3_FORCE_PATH_STYLE=true"
+            echo "S3_INTEGRATION=1"
+          } >> "$GITHUB_ENV"
+
+      - name: Build CI production environment fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BACKEND="$(cat repair-work/evidence/BACKEND_ROOT.txt)"
+
+          if [ -z "$BACKEND" ] || [ ! -d "$BACKEND" ]; then
+            exit 0
+          fi
+
+          cd "$BACKEND"
+
+          export NODE_ENV=production
+          export ACCESS_TOKEN_SECRET="${ACCESS_TOKEN_SECRET:-ci-production-access-token-secret-32-bytes-minimum}"
+          export REFRESH_TOKEN_SECRET="${REFRESH_TOKEN_SECRET:-ci-production-refresh-token-secret-32-bytes-minimum}"
+          export COOKIE_SECRET="${COOKIE_SECRET:-ci-production-cookie-secret-32-bytes-minimum}"
+
+          export PAYMENT_PROVIDER=webhook
+          export STORAGE_BACKEND=s3
+
+          export DATABASE_URL="postgresql://ci:ci@127.0.0.1:5432/hope"
+          export BACKEND_URL="https://ci.example.invalid"
+          export FRONTEND_URL="https://ci.example.invalid"
+          export CORS_ORIGIN="https://ci.example.invalid"
+
+          export S3_ENDPOINT="http://127.0.0.1:9000"
+          export S3_BUCKET=hope-ci
+          export S3_REGION=us-east-1
+          export S3_ACCESS_KEY_ID=minioadmin
+          export S3_SECRET_ACCESS_KEY=minioadmin
+
+          export PASSWORD_RESET_URL="https://ci.example.invalid/reset"
+          export NOTIFICATION_DELIVERY_URL="https://ci.example.invalid/notifications"
+          export NOTIFICATION_DELIVERY_TOKEN="ci-notification-delivery-token"
+
+          {
+            echo "NODE_ENV=$NODE_ENV"
+            echo "ACCESS_TOKEN_SECRET=$ACCESS_TOKEN_SECRET"
+            echo "REFRESH_TOKEN_SECRET=$REFRESH_TOKEN_SECRET"
+            echo "COOKIE_SECRET=$COOKIE_SECRET"
+            echo "PAYMENT_PROVIDER=$PAYMENT_PROVIDER"
+            echo "STORAGE_BACKEND=$STORAGE_BACKEND"
+            echo "DATABASE_URL=$DATABASE_URL"
+            echo "BACKEND_URL=$BACKEND_URL"
+            echo "FRONTEND_URL=$FRONTEND_URL"
+            echo "CORS_ORIGIN=$CORS_ORIGIN"
+            echo "S3_ENDPOINT=$S3_ENDPOINT"
+            echo "S3_BUCKET=$S3_BUCKET"
+            echo "S3_REGION=$S3_REGION"
+            echo "S3_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID"
+            echo "S3_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY"
+            echo "PASSWORD_RESET_URL=$PASSWORD_RESET_URL"
+            echo "NOTIFICATION_DELIVERY_URL=$NOTIFICATION_DELIVERY_URL"
+            echo "NOTIFICATION_DELIVERY_TOKEN=$NOTIFICATION_DELIVERY_TOKEN"
+          } >> "$GITHUB_ENV"
+
+      - name: Baseline validation
+        shell: bash
+        run: |
+          set +e
+
+          ROOT="$(cat repair-work/evidence/FLUTTER_ROOT.txt)"
+
+          cd "$ROOT"
+
+          dart format \
+            --output=none \
+            --set-exit-if-changed . \
+            > "$GITHUB_WORKSPACE/repair-work/results/format.baseline.log" 2>&1
+
+          echo $? \
+            > "$GITHUB_WORKSPACE/repair-work/results/format.rc"
+
+          flutter analyze \
+            > "$GITHUB_WORKSPACE/repair-work/results/analyze.baseline.log" 2>&1
+
+          echo $? \
+            > "$GITHUB_WORKSPACE/repair-work/results/analyze.rc"
+
+          flutter test \
+            > "$GITHUB_WORKSPACE/repair-work/results/flutter-tests.baseline.log" 2>&1
+
+          echo $? \
+            > "$GITHUB_WORKSPACE/repair-work/results/flutter-tests.rc"
+
+      - name: Backend baseline validation
+        shell: bash
+        run: |
+          set +e
+
+          BACKEND="$(cat repair-work/evidence/BACKEND_ROOT.txt)"
+
+          if [ -z "$BACKEND" ] || [ ! -d "$BACKEND" ]; then
+            exit 0
+          fi
+
+          cd "$BACKEND"
+
+          npm run check \
+            > "$GITHUB_WORKSPACE/repair-work/results/backend-check.log" 2>&1
+
+          npm run test:fast \
+            > "$GITHUB_WORKSPACE/repair-work/results/backend-test-fast.log" 2>&1
+
+          npm run test:contract \
+            > "$GITHUB_WORKSPACE/repair-work/results/backend-test-contract.log" 2>&1
+
+          if npm run test:production-env \
+              > "$GITHUB_WORKSPACE/repair-work/results/backend-prod-env.log" 2>&1; then
+            echo PASS > \
+              "$GITHUB_WORKSPACE/repair-work/results/backend-prod-env.status"
+          else
+            echo FAIL > \
+              "$GITHUB_WORKSPACE/repair-work/results/backend-prod-env.status"
+          fi
+
+          if npm run test:s3 \
+              > "$GITHUB_WORKSPACE/repair-work/results/backend-s3.log" 2>&1; then
+            echo PASS > \
+              "$GITHUB_WORKSPACE/repair-work/results/backend-s3.status"
+          else
+            echo FAIL > \
+              "$GITHUB_WORKSPACE/repair-work/results/backend-s3.status"
+          fi
+
+      - name: Collect compact failure context
+        shell: bash
+        run: |
+          set +e
+
+          ROOT="$(cat repair-work/evidence/FLUTTER_ROOT.txt)"
+
+          {
+            echo "# CURRENT FAILURE CONTEXT"
+            echo
+            echo "## Flutter analyze"
+            sed -n '1,500p' repair-work/results/analyze.baseline.log 2>/dev/null || true
+            echo
+            echo "## Flutter tests"
+            sed -n '1,700p' repair-work/results/flutter-tests.baseline.log 2>/dev/null || true
+            echo
+            echo "## Format"
+            sed -n '1,500p' repair-work/results/format.baseline.log 2>/dev/null || true
+            echo
+            echo "## Backend check"
+            sed -n '1,500p' repair-work/results/backend-check.log 2>/dev/null || true
+            echo
+            echo "## Backend fast tests"
+            sed -n '1,700p' repair-work/results/backend-test-fast.log 2>/dev/null || true
+            echo
+            echo "## Backend contract tests"
+            sed -n '1,700p' repair-work/results/backend-test-contract.log 2>/dev/null || true
+            echo
+            echo "## Production environment"
+            sed -n '1,500p' repair-work/results/backend-prod-env.log 2>/dev/null || true
+            echo
+            echo "## S3"
+            sed -n '1,700p' repair-work/results/backend-s3.log 2>/dev/null || true
+            echo
+            echo "## Recent diff"
+            cd "$ROOT"
+            git diff -- . \
+              | sed -n '1,1800p'
+
+          } > repair-work/ai/failure-context.md
+
+      # ================================================================
+      # AI REPAIR ENGINE
+      # ================================================================
+
+      - name: Run AI repair engine
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          ROOT="$(cat repair-work/evidence/FLUTTER_ROOT.txt)"
+
+          cd "$ROOT"
+
+          cat > "$GITHUB_WORKSPACE/repair-work/ai/system-prompt.txt" <<'EOF'
+You are the HOPE Marketplace autonomous senior repair engineer.
+
+You are NOT allowed to redesign the application unnecessarily.
+
+Your task is to diagnose real CI/build/test failures and generate the SMALLEST
+safe source patch that fixes the failure.
+
+Project:
+HOPE Marketplace
+Version:
+3.8.0+11
+
+Toolchain:
+Flutter 3.47.1
+JDK 17
+Node 24
+Android SDK 36
+Android NDK 28.2
+
+Important known historical problems:
+1. Duplicate copy_value_irr_ed45261 in lib/core/ui/hope_l10n.dart
+2. Flutter formatting failures
+3. Android release profile previously defaulted to production during debug
+4. Production signing must remain fail-closed
+5. Production env validation is intentionally strict
+6. S3 integration tests require a real S3-compatible endpoint
+7. CI fixture problems are not application defects
+
+Rules:
+- Do NOT weaken tests.
+- Do NOT delete failing tests.
+- Do NOT skip tests.
+- Do NOT disable analyzer errors.
+- Do NOT remove security controls.
+- Do NOT weaken production validation.
+- Do NOT hardcode production secrets.
+- Do NOT silently change API contracts.
+- Do NOT change application behavior unless necessary for the actual failure.
+- Do NOT modify unrelated files.
+- Prefer one minimal coherent patch.
+- Preserve Flutter/Dart/Kotlin/TypeScript style.
+- Treat generated files as generated.
+- For formatting issues, prefer running formatters rather than hand-editing.
+- If no safe patch exists, say NO_SAFE_PATCH.
+- If the failure is CI/harness configuration rather than source code, say HARNESS_FIX_REQUIRED.
+- Output a unified diff only between:
+  <PATCH>
+  ...
+  </PATCH>
+- The diff must be relative to the detected Flutter project root.
+EOF
+
+          system_prompt="$(
+            cat "$GITHUB_WORKSPACE/repair-work/ai/system-prompt.txt"
+          )"
+
+          context="$(
+            cat "$GITHUB_WORKSPACE/repair-work/ai/latest-audit-context.md"
+            echo
+            cat "$GITHUB_WORKSPACE/repair-work/ai/failure-context.md"
+          )"
+
+          ask_openai() {
+            local input="$1"
+
+            jq -n \
+              --arg model "$OPENAI_MODEL" \
+              --arg system "$system_prompt" \
+              --arg user "$input" \
+              '{
+                model: $model,
+                input: [
+                  {role:"system",content:[{type:"input_text",text:$system}]},
+                  {role:"user",content:[{type:"input_text",text:$user}]}
+                ]
+              }' \
+              > /tmp/openai-request.json
+
+            curl -fsS \
+              https://api.openai.com/v1/responses \
+              -H "Authorization: Bearer $OPENAI_API_KEY" \
+              -H "Content-Type: application/json" \
+              --data-binary @/tmp/openai-request.json \
+              > /tmp/openai-response.json
+
+            jq -r '
+              [
+                .output[]?
+                | .content[]?
+                | select(.type == "output_text")
+                | .text
+              ] | join("\n")
+            ' /tmp/openai-response.json
+          }
+
+          ask_anthropic() {
+            local input="$1"
+
+            jq -n \
+              --arg model "$ANTHROPIC_MODEL" \
+              --arg system "$system_prompt" \
+              --arg user "$input" \
+              '{
+                model:$model,
+                max_tokens:8000,
+                system:$system,
+                messages:[
+                  {
+                    role:"user",
+                    content:$user
+                  }
+                ]
+              }' \
+              > /tmp/anthropic-request.json
+
+            curl -fsS \
+              https://api.anthropic.com/v1/messages \
+              -H "x-api-key: $ANTHROPIC_API_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "Content-Type: application/json" \
+              --data-binary @/tmp/anthropic-request.json \
+              > /tmp/anthropic-response.json
+
+            jq -r '
+              [
+                .content[]?
+                | select(.type == "text")
+                | .text
+              ] | join("\n")
+            ' /tmp/anthropic-response.json
+          }
+
+          ask_gemini() {
+            local input="$1"
+
+            jq -n \
+              --arg system "$system_prompt" \
+              --arg user "$input" \
+              '{
+                system_instruction:{
+                  parts:[
+                    {text:$system}
+                  ]
+                },
+                contents:[
+                  {
+                    role:"user",
+                    parts:[
+                      {text:$user}
+                    ]
+                  }
+                ],
+                generationConfig:{
+                  temperature:0.1,
+                  maxOutputTokens:8000
+                }
+              }' \
+              > /tmp/gemini-request.json
+
+            curl -fsS \
+              "https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent" \
+              -H "x-goog-api-key: $GEMINI_API_KEY" \
+              -H "Content-Type: application/json" \
+              --data-binary @/tmp/gemini-request.json \
+              > /tmp/gemini-response.json
+
+            jq -r '
+              [
+                .candidates[]?
+                | .content.parts[]?
+                | .text?
+                | select(. != null)
+              ] | join("\n")
+            ' /tmp/gemini-response.json
+          }
+
+          extract_patch() {
+            local input="$1"
+
+            awk '
+              /<PATCH>/ {
+                inside=1
+                next
+              }
+              /<\/PATCH>/ {
+                inside=0
+              }
+              inside {
+                print
+              }
+            ' "$input"
+          }
+
+          apply_candidate_patch() {
+            local candidate="$1"
+
+            if [ ! -s "$candidate" ]; then
+              return 1
+            fi
+
+            if grep -Eq \
+              "NO_SAFE_PATCH|HARNESS_FIX_REQUIRED" \
+              "$candidate"; then
+              return 1
+            fi
+
+            if ! grep -q \
+              '^diff --git ' \
+              "$candidate"; then
+              return 1
+            fi
+
+            git apply \
+              --check \
+              "$candidate" \
+              >/dev/null 2>&1 \
+              || return 1
+
+            cp "$candidate" \
+              "$GITHUB_WORKSPACE/repair-work/patches/accepted.diff"
+
+            git apply "$candidate"
+
+            return 0
+          }
+
+          max_rounds="${MAX_REPAIR_ROUNDS:-5}"
+
+          for round in $(seq 1 "$max_rounds"); do
+
+            echo
+            echo "=================================================="
+            echo "AI REPAIR ROUND $round / $max_rounds"
+            echo "=================================================="
+
+            cat > "$GITHUB_WORKSPACE/repair-work/ai/current-request.txt" <<EOF
+HOPE Repair Round: $round
+
+You are inspecting the CURRENT repository after all previous deterministic
+and accepted repairs.
+
+Here is the audit context and current evidence:
+
+$context
+
+Current git diff:
+$(git diff -- . | sed -n '1,2500p')
+
+Goal:
+Fix the highest-confidence remaining root cause(s).
+
+Return only one of:
+1. <PATCH> ... </PATCH>
+2. NO_SAFE_PATCH
+3. HARNESS_FIX_REQUIRED
+EOF
+
+            request="$(
+              cat "$GITHUB_WORKSPACE/repair-work/ai/current-request.txt"
+            )"
+
+            rm -f repair-work/ai/openai.txt
+            rm -f repair-work/ai/anthropic.txt
+            rm -f repair-work/ai/gemini.txt
+
+            if [ -n "${OPENAI_API_KEY:-}" ]; then
+              ask_openai "$request" \
+                > repair-work/ai/openai.txt \
+                || true
+            fi
+
+            if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+              ask_anthropic "$request" \
+                > repair-work/ai/anthropic.txt \
+                || true
+            fi
+
+            if [ -n "${GEMINI_API_KEY:-}" ]; then
+              ask_gemini "$request" \
+                > repair-work/ai/gemini.txt \
+                || true
+            fi
+
+            # ----------------------------------------------------------
+            # Choose candidate.
+            #
+            # Preference:
+            # 1. OpenAI
+            # 2. Anthropic
+            # 3. Gemini
+            #
+            # Every candidate still passes:
+            # git apply --check
+            # source validation
+            # full test/build cycle
+            # ----------------------------------------------------------
+
+            chosen=""
+
+            for model_file in \
+              repair-work/ai/openai.txt \
+              repair-work/ai/anthropic.txt \
+              repair-work/ai/gemini.txt
+            do
+              if [ ! -s "$model_file" ]; then
+                continue
+              fi
+
+              extract_patch "$model_file" \
+                > repair-work/ai/candidate.diff \
+                || true
+
+              if [ ! -s repair-work/ai/candidate.diff ]; then
+                continue
+              fi
+
+              if grep -q '^diff --git ' \
+                repair-work/ai/candidate.diff; then
+
+                if git apply --check \
+                  repair-work/ai/candidate.diff \
+                  >/dev/null 2>&1; then
+
+                  chosen="repair-work/ai/candidate.diff"
+                  break
+                fi
+              fi
+            done
+
+            if [ -z "$chosen" ]; then
+              echo "No safe AI patch proposed."
+              break
+            fi
+
+            cp "$chosen" \
+              "repair-work/patches/round-${round}.diff"
+
+            git apply "$chosen"
+
+            echo
+            echo "Accepted patch:"
+            git diff --stat
+
+            # ----------------------------------------------------------
+            # Format changed files only.
+            # ----------------------------------------------------------
+            git diff --name-only \
+              | grep -E '\.(dart|kt|kts|java|gradle|yaml|yml|json|js|mjs|ts)$' \
+              | while read -r changed; do
+                  case "$changed" in
+                    *.dart)
+                      dart format "$changed" >/dev/null 2>&1 || true
+                      ;;
+                  esac
+                done
+
+            # ----------------------------------------------------------
+            # Validate after every AI patch.
+            # ----------------------------------------------------------
+            validation_failed=0
+
+            dart format \
+              --output=none \
+              --set-exit-if-changed . \
+              > repair-work/results/round-${round}-format.log 2>&1 \
+              || validation_failed=1
+
+            flutter analyze \
+              > repair-work/results/round-${round}-analyze.log 2>&1 \
+              || validation_failed=1
+
+            flutter test \
+              > repair-work/results/round-${round}-flutter-test.log 2>&1 \
+              || validation_failed=1
+
+            BACKEND="$(cat repair-work/evidence/BACKEND_ROOT.txt)"
+
+            if [ -n "$BACKEND" ] && [ -f "$BACKEND/package.json" ]; then
+              (
+                cd "$BACKEND"
+
+                npm run check \
+                  > "$GITHUB_WORKSPACE/repair-work/results/round-${round}-backend-check.log" \
+                  2>&1
+
+                npm run test:fast \
+                  > "$GITHUB_WORKSPACE/repair-work/results/round-${round}-backend-fast.log" \
+                  2>&1
+
+                npm run test:contract \
+                  > "$GITHUB_WORKSPACE/repair-work/results/round-${round}-backend-contract.log" \
+                  2>&1
+
+                npm run test:production-env \
+                  > "$GITHUB_WORKSPACE/repair-work/results/round-${round}-backend-prod-env.log" \
+                  2>&1
+
+                npm run test:s3 \
+                  > "$GITHUB_WORKSPACE/repair-work/results/round-${round}-backend-s3.log" \
+                  2>&1
+              ) || validation_failed=1
+            fi
+
+            if [ "$validation_failed" -eq 0 ]; then
+              echo "ROUND_${round}=PASS" \
+                >> repair-work/results/ai-rounds.status
+              break
+            fi
+
+            echo "ROUND_${round}=CONTINUE" \
+              >> repair-work/results/ai-rounds.status
+
+            {
+              echo "=== ROUND $round NEW FAILURE CONTEXT ==="
+              echo
+              sed -n '1,600p' \
+                "repair-work/results/round-${round}-format.log"
+              echo
+              sed -n '1,900p' \
+                "repair-work/results/round-${round}-analyze.log"
+              echo
+              sed -n '1,1200p' \
+                "repair-work/results/round-${round}-flutter-test.log"
+              echo
+              sed -n '1,900p' \
+                "repair-work/results/round-${round}-backend-check.log"
+              echo
+              sed -n '1,1200p' \
+                "repair-work/results/round-${round}-backend-fast.log"
+              echo
+              sed -n '1,1200p' \
+                "repair-work/results/round-${round}-backend-contract.log"
+              echo
+              sed -n '1,900p' \
+                "repair-work/results/round-${round}-backend-prod-env.log"
+              echo
+              sed -n '1,1200p' \
+                "repair-work/results/round-${round}-backend-s3.log"
+            } > repair-work/ai/failure-context.md
+
+            context="$(
+              cat repair-work/ai/latest-audit-context.md
+              echo
+              cat repair-work/ai/failure-context.md
+            )"
+
+          done
+
+      - name: Create CI-only pilot signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p repair-work/signing
+
+          keytool \
+            -genkeypair \
+            -v \
+            -keystore repair-work/signing/ci-pilot.jks \
+            -storepass changeit \
+            -keypass changeit \
+            -alias hope-pilot-ci \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 2 \
+            -dname "CN=HOPE CI Pilot,OU=CI,O=HOPE,L=CI,S=CI,C=US"
+
+          cat > repair-work/signing/key.properties <<'EOF'
+storeFile=ci-pilot.jks
+storePassword=changeit
+keyAlias=hope-pilot-ci
+keyPassword=changeit
+EOF
+
+      - name: Build Pilot APK
+        shell: bash
+        run: |
+          set +e
+
+          ROOT="$(cat repair-work/evidence/FLUTTER_ROOT.txt)"
+
+          cd "$ROOT"
+
+          mkdir -p "$GITHUB_WORKSPACE/repair-work/pilot"
+
+          export BUILD_PROFILE=pilot
+
+          flutter clean \
+            > "$GITHUB_WORKSPACE/repair-work/results/flutter-clean.log" 2>&1
+
+          flutter pub get \
+            > "$GITHUB_WORKSPACE/repair-work/results/final-pub-get.log" 2>&1
+
+          flutter gen-l10n \
+            > "$GITHUB_WORKSPACE/repair-work/results/final-gen-l10n.log" 2>&1
+
+          dart format \
+            --output=none \
+            --set-exit-if-changed . \
+            > "$GITHUB_WORKSPACE/repair-work/results/final-format.log" 2>&1
+
+          FORMAT_RC=$?
+
+          flutter analyze \
+            > "$GITHUB_WORKSPACE/repair-work/results/final-analyze.log" 2>&1
+
+          ANALYZE_RC=$?
+
+          flutter test \
+            > "$GITHUB_WORKSPACE/repair-work/results/final-flutter-test.log" 2>&1
+
+          FLUTTER_TEST_RC=$?
+
+          flutter build apk \
+            --debug \
+            --dart-define=BUILD_PROFILE=pilot \
+            > "$GITHUB_WORKSPACE/repair-work/results/pilot-debug-build.log" 2>&1
+
+          DEBUG_RC=$?
+
+          flutter build apk \
+            --release \
+            --dart-define=BUILD_PROFILE=pilot \
+            > "$GITHUB_WORKSPACE/repair-work/results/pilot-release-build.log" 2>&1
+
+          RELEASE_RC=$?
+
+          {
+            echo "FORMAT_RC=$FORMAT_RC"
+            echo "ANALYZE_RC=$ANALYZE_RC"
+            echo "FLUTTER_TEST_RC=$FLUTTER_TEST_RC"
+            echo "DEBUG_RC=$DEBUG_RC"
+            echo "RELEASE_RC=$RELEASE_RC"
+          } > "$GITHUB_WORKSPACE/repair-work/results/final-build.status"
+
+          APK="$(find build/app/outputs/apk \
+            -type f \
+            -name '*.apk' \
+            -print \
+            2>/dev/null \
+            | sort \
+            | tail -n 1)"
+
+          if [ -n "$APK" ]; then
+            cp "$APK" \
+              "$GITHUB_WORKSPACE/repair-work/pilot/HOPE-pilot.apk"
+
+            sha256sum "$APK" \
+              > "$GITHUB_WORKSPACE/repair-work/pilot/HOPE-pilot.apk.sha256"
+          fi
+
+          # Never hide a real failure.
+          if [ "$FORMAT_RC" -ne 0 ] \
+            || [ "$ANALYZE_RC" -ne 0 ] \
+            || [ "$FLUTTER_TEST_RC" -ne 0 ] \
+            || [ "$RELEASE_RC" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Final backend verification
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BACKEND="$(cat repair-work/evidence/BACKEND_ROOT.txt)"
+
+          if [ -z "$BACKEND" ] || [ ! -d "$BACKEND" ]; then
+            exit 0
+          fi
+
+          cd "$BACKEND"
+
+          npm run check
+
+          npm run test:fast
+
+          npm run test:contract
+
+          npm run test:production-env
+
+          npm run test:s3
+
+          npm audit \
+            --audit-level=high
+
+      - name: Verify pilot artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f repair-work/pilot/HOPE-pilot.apk
+
+          unzip -t \
+            repair-work/pilot/HOPE-pilot.apk \
+            >/dev/null
+
+          sha256sum \
+            repair-work/pilot/HOPE-pilot.apk
+
+      - name: Create repair report
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          ROOT="$(cat repair-work/evidence/FLUTTER_ROOT.txt 2>/dev/null || true)"
+
+          {
+            echo "# HOPE Auto Repair → Pilot Build Report"
+            echo
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Commit: $GITHUB_SHA"
+            echo "Run: $GITHUB_RUN_ID"
+            echo "UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "## Source"
+            cat repair-work/evidence/source-bundle.sha256 2>/dev/null || true
+            echo
+            echo "## Toolchain"
+            cat repair-work/evidence/flutter-version.log 2>/dev/null || true
+            echo
+            echo "## Deterministic repairs"
+            sed -n '1,500p' \
+              repair-work/patches/deterministic/README.txt \
+              2>/dev/null || true
+            echo
+            echo "## AI rounds"
+            cat repair-work/results/ai-rounds.status \
+              2>/dev/null || true
+            echo
+            echo "## Final build status"
+            cat repair-work/results/final-build.status \
+              2>/dev/null || true
+            echo
+            echo "## Pilot APK"
+            ls -lh \
+              repair-work/pilot/HOPE-pilot.apk \
+              2>/dev/null || true
+            echo
+            echo "## Final diff stat"
+            if [ -n "$ROOT" ] && [ -d "$ROOT/.git" ]; then
+              cd "$ROOT"
+              git diff --stat
+            fi
+            echo
+            echo "## Final changed files"
+            if [ -n "$ROOT" ] && [ -d "$ROOT/.git" ]; then
+              git diff --name-only
+            fi
+
+          } > repair-work/FINAL-REPAIR-REPORT.md
+
+      - name: Upload repair workspace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-AUTO-REPAIR-WORKSPACE-${{ github.run_number }}
+          path: |
+            repair-work/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload Pilot APK
+        if: success() && hashFiles('repair-work/pilot/HOPE-pilot.apk') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-PILOT-APK-${{ github.run_number }}
+          path: |
+            repair-work/pilot/HOPE-pilot.apk
+            repair-work/pilot/HOPE-pilot.apk.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Package repaired source
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$(cat repair-work/evidence/FLUTTER_ROOT.txt)"
+
+          mkdir -p repair-work/final-source
+
+          rsync -a \
+            --exclude='.git/' \
+            --exclude='.dart_tool/' \
+            --exclude='build/' \
+            --exclude='backend/node_modules/' \
+            "$ROOT/" \
+            repair-work/final-source/
+
+          (
+            cd repair-work/final-source
+
+            find . \
+              -type f \
+              -print0 \
+              | sort -z \
+              | xargs -0 touch -d '2000-01-01 00:00:00 UTC'
+
+            zip -qr \
+              "$GITHUB_WORKSPACE/HOPE-3_8_0-PILOT-REPAIRED.zip" \
+              .
+          )
+
+          sha256sum \
+            HOPE-3_8_0-PILOT-REPAIRED.zip
+
+      - name: Upload repaired source
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-3_8_0-PILOT-REPAIRED-${{ github.run_number }}
+          path: |
+            HOPE-3_8_0-PILOT-REPAIRED.zip
+            repair-work/FINAL-REPAIR-REPORT.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload workspace for downstream job
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hope-repair-workspace
+          path: repair-work/**
+          if-no-files-found: warn
+          retention-days: 1
+
+
+  publish:
+    name: Publish Repair Through PR / Commit
+    needs: repair
+    if: ${{ success() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Download repaired source artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: HOPE-3_8_0-PILOT-REPAIRED-${{ github.run_number }}
+          path: repair-artifact
+
+      - name: Extract repaired source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf repaired-source
+          mkdir -p repaired-source
+
+          unzip -q \
+            repair-artifact/HOPE-3_8_0-PILOT-REPAIRED.zip \
+            -d repaired-source
+
+      - name: Publish repaired source
+        if: ${{ inputs.push_repaired_commit || inputs.create_pull_request }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          BRANCH="auto-repair/pilot-${GITHUB_RUN_NUMBER}"
+
+          git checkout -b "$BRANCH"
+
+          rsync -a \
+            --delete \
+            --exclude='.git/' \
+            repaired-source/ \
+            ./
+
+          git config user.name \
+            "github-actions[bot]"
+
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No source changes to publish."
+            exit 0
+          fi
+
+          git commit -m \
+            "fix(hope): autonomous repair for pilot readiness [skip ci]"
+
+          if [ "${{ inputs.push_repaired_commit }}" = "true" ]; then
+            git push \
+              --set-upstream \
+              origin "$BRANCH"
+          else
+            git push \
+              origin "$BRANCH"
+          fi
+
+          if [ "${{ inputs.create_pull_request }}" = "true" ]; then
+
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title \
+                "HOPE: autonomous repair → pilot readiness" \
+              --body \
+                "Automated repair workflow completed successfully.
+
+Source:
+${GITHUB_SHA}
+
+The workflow:
+- analyzed latest audit evidence
+- applied deterministic repairs
+- optionally used multiple AI providers for bounded patch generation
+- re-ran Flutter/backend verification
+- built the pilot APK
+- preserved repair evidence as workflow artifacts
+
+Please review the generated diff before merging."
+          fi
