@@ -2,11 +2,6 @@ name: HOPE ZIP Bootstrap
 
 on:
   workflow_dispatch:
-    inputs:
-      archive:
-        description: "ZIP filename in repository (leave blank to auto-detect)"
-        required: false
-        type: string
 
 permissions:
   contents: write
@@ -29,36 +24,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Locate ZIP archive
+      - name: Locate HOPE ZIP
         id: locate
         shell: bash
         run: |
           set -euo pipefail
 
-          INPUT_ARCHIVE="${{ inputs.archive }}"
+          ARCHIVE=""
 
-          if [ -n "$INPUT_ARCHIVE" ]; then
-            if [ ! -f "$INPUT_ARCHIVE" ]; then
-              echo "ERROR: Requested archive does not exist: $INPUT_ARCHIVE"
-              exit 1
+          for file in HOPE-*.zip; do
+            if [ -f "$file" ]; then
+              ARCHIVE="$file"
+              break
             fi
+          done
 
-            ARCHIVE="$INPUT_ARCHIVE"
-          else
-            mapfile -t ZIPS < <(find . -maxdepth 2 -type f -name 'HOPE-*.zip' -print)
-
-            if [ "${#ZIPS[@]}" -eq 0 ]; then
-              echo "ERROR: No HOPE-*.zip archive found."
-              exit 1
-            fi
-
-            if [ "${#ZIPS[@]}" -gt 1 ]; then
-              echo "Multiple HOPE archives found:"
-              printf ' - %s\n' "${ZIPS[@]}"
-              echo "Using the first matching archive."
-            fi
-
-            ARCHIVE="${ZIPS[0]}"
+          if [ -z "$ARCHIVE" ]; then
+            echo "ERROR: HOPE ZIP not found."
+            exit 1
           fi
 
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
@@ -74,38 +57,28 @@ jobs:
 
           unzip -q "${{ steps.locate.outputs.archive }}" -d .hope-work/source
 
-          echo "Extracted files:"
-          find .hope-work/source -maxdepth 3 -type f | head -100
+          echo "Searching for Flutter project..."
 
-      - name: Locate Flutter project
-        id: flutter_project
-        shell: bash
-        run: |
-          set -euo pipefail
+          PROJECT_DIR="$(find .hope-work/source -type f -name pubspec.yaml -print -quit | xargs dirname)"
 
-          PROJECT_DIR="$(find .hope-work/source -type f -name pubspec.yaml -print -quit | xargs -r dirname)"
-
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: Flutter project containing pubspec.yaml was not found."
-            exit 1
-          fi
-
-          if [ ! -f "$PROJECT_DIR/android/gradlew" ]; then
-            echo "ERROR: Flutter Android project not found at: $PROJECT_DIR"
+          if [ -z "$PROJECT_DIR" ] || [ "$PROJECT_DIR" = "." ]; then
+            echo "ERROR: Flutter project not found."
             exit 1
           fi
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Flutter project: $PROJECT_DIR"
 
-      - name: Set up Java 17
+          echo "Flutter project:"
+          echo "$PROJECT_DIR"
+
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
           cache: gradle
 
-      - name: Set up Flutter 3.47.0
+      - name: Setup Flutter 3.47.0
         uses: subosito/flutter-action@v2
         with:
           flutter-version: "3.47.0"
@@ -117,18 +90,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "========================================"
-          echo "HOPE TOOLCHAIN"
-          echo "========================================"
-
           flutter --version
           dart --version
           java -version
-          echo "Gradle wrapper:"
-          cd "$PROJECT_DIR/android"
-          ./gradlew --version
 
-      - name: Configure API base URL
+      - name: Configure API_BASE_URL
         shell: bash
         env:
           API_BASE_URL_SECRET: ${{ secrets.API_BASE_URL }}
@@ -144,18 +110,6 @@ jobs:
 
           if [ -z "$API_BASE_URL" ]; then
             echo "ERROR: API_BASE_URL is not configured."
-            echo ""
-            echo "Configure one of these in:"
-            echo "Repository -> Settings -> Secrets and variables -> Actions"
-            echo ""
-            echo "Option A - Repository secret:"
-            echo "API_BASE_URL"
-            echo ""
-            echo "Option B - Repository variable:"
-            echo "API_BASE_URL"
-            echo ""
-            echo "Expected format:"
-            echo "https://YOUR-API-HOST/api/v1"
             exit 1
           fi
 
@@ -172,62 +126,78 @@ jobs:
 
           echo "API_BASE_URL configured: yes"
 
-      - name: Verify project configuration
+      - name: Prepare project
         shell: bash
         run: |
           set -euo pipefail
 
           cd "$PROJECT_DIR"
 
-          echo "========================================"
-          echo "HOPE PROJECT"
-          echo "========================================"
-          echo "PROJECT_DIR=$PROJECT_DIR"
-          echo "BUILD_PROFILE=$BUILD_PROFILE"
-          echo "API_BASE_URL configured: yes"
-          echo "========================================"
+          chmod +x android/gradlew
 
-          test -f pubspec.yaml
-          test -d android
-          test -f android/gradlew
-
-      - name: Prepare Gradle wrapper
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "$PROJECT_DIR/android"
-
-          chmod +x gradlew
-
-          if [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+          if [ -f android/gradle/wrapper/gradle-wrapper.properties ]; then
             sed -i \
               's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14-bin.zip#' \
-              gradle/wrapper/gradle-wrapper.properties
+              android/gradle/wrapper/gradle-wrapper.properties
           fi
-
-          echo "Gradle wrapper:"
-          grep "distributionUrl" gradle/wrapper/gradle-wrapper.properties || true
-
-      - name: Flutter clean and dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "$PROJECT_DIR"
 
           flutter clean
           flutter pub get
 
-      - name: Flutter analyzer
+      - name: Build APK
         shell: bash
-        continue-on-error: true
         run: |
           set -euo pipefail
 
           cd "$PROJECT_DIR"
 
-          flutter analyze
+          echo "========================================"
+          echo "HOPE Android APK Build"
+          echo "BUILD_PROFILE=$BUILD_PROFILE"
+          echo "Flutter=3.47.0"
+          echo "API_BASE_URL configured=yes"
+          echo "========================================"
 
-      - name: Build HOPE APK
-        shell
+          if [ -f tools/build_apk_release.sh ]; then
+            chmod +x tools/build_apk_release.sh
+
+            API_BASE_URL="$API_BASE_URL" \
+            BUILD_PROFILE="$BUILD_PROFILE" \
+            CI_ZIP_BUILD="$CI_ZIP_BUILD" \
+            ./tools/build_apk_release.sh
+          else
+            flutter build apk \
+              --release \
+              --dart-define="API_BASE_URL=$API_BASE_URL" \
+              --dart-define="BUILD_PROFILE=$BUILD_PROFILE"
+          fi
+
+      - name: Find APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          APK="$(find build/app/outputs -type f -name '*.apk' -print -quit)"
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+          cp "$APK" \
+            "$GITHUB_WORKSPACE/artifacts/HOPE-pilot-release.apk"
+
+          echo "APK:"
+          ls -lh "$GITHUB_WORKSPACE/artifacts/HOPE-pilot-release.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-pilot-APK
+          path: artifacts/HOPE-pilot-release.apk
+          if-no-files-found: error
+          retention-days: 14
