@@ -11,37 +11,43 @@ permissions:
   contents: read
 
 env:
-  FLUTTER_VERSION: 3.47.1
+  FLUTTER_VERSION: "3.47.1"
   JAVA_VERSION: "17"
   NODE_VERSION: "24"
+  AUDIT_TIMEOUT_MINUTES: "20"
 
 jobs:
   audit:
     name: HOPE Complete Audit
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Create audit workspace
+      - name: Initialize audit
         shell: bash
         run: |
           set +e
 
+          rm -rf audit-results source
           mkdir -p audit-results
           mkdir -p source
 
           {
-            echo "HOPE Marketplace Full Audit"
+            echo "HOPE Marketplace — Complete Audit"
             echo "Repository: $GITHUB_REPOSITORY"
             echo "Commit: $GITHUB_SHA"
             echo "Run ID: $GITHUB_RUN_ID"
-            echo "Started UTC: $(date -u)"
+            echo "UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "Flutter: $FLUTTER_VERSION"
+            echo "Java: $JAVA_VERSION"
+            echo "Node: $NODE_VERSION"
           } > audit-results/SUMMARY.txt
 
-      - name: Locate HOPE source ZIP
+      - name: Locate and extract HOPE source
         shell: bash
         run: |
           set +e
@@ -54,9 +60,9 @@ jobs:
             "HOPE-marketplace-test-apk-ready-v5-1.zip"
           )
 
-          for f in "${CANDIDATES[@]}"; do
-            if [ -f "$f" ]; then
-              ZIP="$f"
+          for candidate in "${CANDIDATES[@]}"; do
+            if [ -f "$candidate" ]; then
+              ZIP="$candidate"
               break
             fi
           done
@@ -71,30 +77,58 @@ jobs:
             exit 0
           fi
 
-          echo "PASS" > audit-results/source.status
-          echo "SOURCE_ZIP=$ZIP" | tee audit-results/source.log
+          echo "SOURCE_ZIP=$ZIP" > audit-results/source.log
 
-          unzip -q "$ZIP" -d source
-
-          ROOT="$(find source -type f -name pubspec.yaml -print -quit | xargs -r dirname)"
-
-          if [ -z "$ROOT" ]; then
-            ROOT="$(find source -type d -name hope_mobile -print -quit)"
-          fi
-
-          if [ -z "$ROOT" ]; then
-            echo "BLOCKED" > audit-results/root.status
-            echo "Flutter project root was not found." > audit-results/root.log
+          if ! unzip -t "$ZIP" > audit-results/zip-integrity.log 2>&1; then
+            echo "FAIL" > audit-results/source.status
+            echo "ZIP integrity check failed." >> audit-results/source.log
             exit 0
           fi
 
-          ROOT="$(cd "$ROOT" && pwd)"
+          unzip -q "$ZIP" -d source
 
-          echo "$ROOT" > audit-results/PROJECT_ROOT.txt
+          echo "PASS" > audit-results/source.status
+
+          FLUTTER_ROOT=""
+
+          FLUTTER_ROOT="$(find source -type f -name pubspec.yaml -print -quit | xargs -r dirname)"
+
+          if [ -z "$FLUTTER_ROOT" ]; then
+            FLUTTER_ROOT="$(find source -type d -name hope_mobile -print -quit)"
+          fi
+
+          if [ -z "$FLUTTER_ROOT" ]; then
+            echo "BLOCKED" > audit-results/flutter-root.status
+            echo "Flutter project root could not be detected." > audit-results/flutter-root.log
+          else
+            FLUTTER_ROOT="$(cd "$FLUTTER_ROOT" && pwd)"
+            echo "$FLUTTER_ROOT" > audit-results/FLUTTER_ROOT.txt
+            echo "PASS" > audit-results/flutter-root.status
+          fi
+
+          BACKEND_ROOT=""
+
+          if [ -n "$FLUTTER_ROOT" ] && [ -d "$FLUTTER_ROOT/backend" ]; then
+            BACKEND_ROOT="$FLUTTER_ROOT/backend"
+          fi
+
+          if [ -z "$BACKEND_ROOT" ]; then
+            BACKEND_ROOT="$(find source -type f -name package.json -print -quit | xargs -r dirname)"
+          fi
+
+          if [ -n "$BACKEND_ROOT" ] && [ -f "$BACKEND_ROOT/package.json" ]; then
+            BACKEND_ROOT="$(cd "$BACKEND_ROOT" && pwd)"
+            echo "$BACKEND_ROOT" > audit-results/BACKEND_ROOT.txt
+            echo "PASS" > audit-results/backend-root.status
+          else
+            echo "BLOCKED" > audit-results/backend-root.status
+            echo "Backend package.json could not be detected." > audit-results/backend-root.log
+          fi
 
           {
             echo
-            echo "PROJECT_ROOT=$ROOT"
+            echo "FLUTTER_ROOT=${FLUTTER_ROOT:-NOT_FOUND}"
+            echo "BACKEND_ROOT=${BACKEND_ROOT:-NOT_FOUND}"
           } >> audit-results/SUMMARY.txt
 
       - name: Setup Java 17
@@ -126,12 +160,47 @@ jobs:
           node --version > audit-results/node-version.log 2>&1
           npm --version > audit-results/npm-version.log 2>&1
 
+      - name: Audit project structure
+        shell: bash
+        run: |
+          set +e
+
+          ROOT="$(cat audit-results/FLUTTER_ROOT.txt 2>/dev/null)"
+
+          if [ -z "$ROOT" ]; then
+            echo "BLOCKED" > audit-results/project-structure.status
+            exit 0
+          fi
+
+          {
+            echo "=== TOP LEVEL ==="
+            find "$ROOT" -maxdepth 2 -type f | sort | head -n 1000
+
+            echo
+            echo "=== PUBSPEC ==="
+            sed -n '1,240p' "$ROOT/pubspec.yaml"
+
+            echo
+            echo "=== PROJECT VERSION ==="
+            grep -nE '^(name|version):' "$ROOT/pubspec.yaml" 2>/dev/null
+
+            echo
+            echo "=== LOCK FILE ==="
+            if [ -f "$ROOT/pubspec.lock" ]; then
+              echo "pubspec.lock PRESENT"
+            else
+              echo "pubspec.lock MISSING"
+            fi
+          } > audit-results/project-structure.log 2>&1
+
+          echo "PASS" > audit-results/project-structure.status
+
       - name: Flutter dependency audit
         shell: bash
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
+          ROOT="$(cat audit-results/FLUTTER_ROOT.txt 2>/dev/null)"
 
           if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
             echo "BLOCKED" > audit-results/flutter-dependencies.status
@@ -140,48 +209,95 @@ jobs:
 
           cd "$ROOT"
 
+          LOCK_BEFORE="MISSING"
+
+          if [ -f pubspec.lock ]; then
+            LOCK_BEFORE="PRESENT"
+            sha256sum pubspec.lock > "$GITHUB_WORKSPACE/audit-results/pubspec-lock-before.sha256"
+          fi
+
           {
-            echo "========================================"
-            echo "PUBSPEC LOCK"
-            echo "========================================"
-
-            if [ -f pubspec.lock ]; then
-              echo "PASS: pubspec.lock exists"
-            else
-              echo "BLOCKED: pubspec.lock is missing"
-            fi
-
+            echo "LOCK_BEFORE=$LOCK_BEFORE"
             echo
-            echo "========================================"
-            echo "PUB GET"
-            echo "========================================"
+            echo "=== PUB GET ==="
 
             flutter pub get
+            PUB_RC=$?
 
             echo
-            echo "========================================"
-            echo "GEN L10N"
-            echo "========================================"
+            echo "PUB_GET_EXIT_CODE=$PUB_RC"
+
+            echo
+            echo "=== GEN L10N ==="
 
             flutter gen-l10n
+            L10N_RC=$?
+
+            echo
+            echo "GEN_L10N_EXIT_CODE=$L10N_RC"
+
+            echo
+            echo "=== LOCK AFTER ==="
+
+            if [ -f pubspec.lock ]; then
+              echo "pubspec.lock PRESENT AFTER pub get"
+              sha256sum pubspec.lock
+            else
+              echo "pubspec.lock STILL MISSING"
+            fi
+
           } > "$GITHUB_WORKSPACE/audit-results/flutter-dependencies.log" 2>&1
 
-          RC=$?
-
-          if [ "$RC" -eq 0 ]; then
+          if [ "$PUB_RC" -eq 0 ] && [ "$L10N_RC" -eq 0 ]; then
             echo "PASS" > "$GITHUB_WORKSPACE/audit-results/flutter-dependencies.status"
           else
             echo "FAIL" > "$GITHUB_WORKSPACE/audit-results/flutter-dependencies.status"
           fi
 
+          if [ "$LOCK_BEFORE" = "MISSING" ]; then
+            echo "BLOCKED" > "$GITHUB_WORKSPACE/audit-results/pubspec-lock.status"
+          else
+            echo "PASS" > "$GITHUB_WORKSPACE/audit-results/pubspec-lock.status"
+          fi
+
           exit 0
 
-      - name: Flutter format and analyze
+      - name: Flutter format audit
         shell: bash
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
+          ROOT="$(cat audit-results/FLUTTER_ROOT.txt 2>/dev/null)"
+
+          if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
+            echo "BLOCKED" > audit-results/flutter-format.status
+            exit 0
+          fi
+
+          cd "$ROOT"
+
+          dart format --output=none --set-exit-if-changed . \
+            > "$GITHUB_WORKSPACE/audit-results/flutter-format.log" 2>&1
+
+          RC=$?
+
+          echo "EXIT_CODE=$RC" \
+            >> "$GITHUB_WORKSPACE/audit-results/flutter-format.log"
+
+          if [ "$RC" -eq 0 ]; then
+            echo "PASS" > "$GITHUB_WORKSPACE/audit-results/flutter-format.status"
+          else
+            echo "FAIL" > "$GITHUB_WORKSPACE/audit-results/flutter-format.status"
+          fi
+
+          exit 0
+
+      - name: Flutter analyze
+        shell: bash
+        run: |
+          set +e
+
+          ROOT="$(cat audit-results/FLUTTER_ROOT.txt 2>/dev/null)"
 
           if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
             echo "BLOCKED" > audit-results/flutter-analyze.status
@@ -190,32 +306,15 @@ jobs:
 
           cd "$ROOT"
 
-          {
-            echo "========================================"
-            echo "DART FORMAT"
-            echo "========================================"
+          flutter analyze \
+            > "$GITHUB_WORKSPACE/audit-results/flutter-analyze.log" 2>&1
 
-            dart format --set-exit-if-changed .
+          RC=$?
 
-            FORMAT_RC=$?
+          echo "EXIT_CODE=$RC" \
+            >> "$GITHUB_WORKSPACE/audit-results/flutter-analyze.log"
 
-            echo
-            echo "FORMAT_EXIT_CODE=$FORMAT_RC"
-
-            echo
-            echo "========================================"
-            echo "FLUTTER ANALYZE"
-            echo "========================================"
-
-            flutter analyze
-
-            ANALYZE_RC=$?
-
-            echo
-            echo "ANALYZE_EXIT_CODE=$ANALYZE_RC"
-          } > "$GITHUB_WORKSPACE/audit-results/flutter-analyze.log" 2>&1
-
-          if [ "$FORMAT_RC" -eq 0 ] && [ "$ANALYZE_RC" -eq 0 ]; then
+          if [ "$RC" -eq 0 ]; then
             echo "PASS" > "$GITHUB_WORKSPACE/audit-results/flutter-analyze.status"
           else
             echo "FAIL" > "$GITHUB_WORKSPACE/audit-results/flutter-analyze.status"
@@ -223,12 +322,12 @@ jobs:
 
           exit 0
 
-      - name: Flutter unit and widget tests
+      - name: Flutter tests
         shell: bash
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
+          ROOT="$(cat audit-results/FLUTTER_ROOT.txt 2>/dev/null)"
 
           if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
             echo "BLOCKED" > audit-results/flutter-tests.status
@@ -253,39 +352,124 @@ jobs:
 
           exit 0
 
-      - name: Backend audit
+      - name: Discover backend scripts
         shell: bash
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
+          BACKEND="$(cat audit-results/BACKEND_ROOT.txt 2>/dev/null)"
 
-          if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
-            echo "BLOCKED" > audit-results/backend.status
+          if [ -z "$BACKEND" ] || [ ! -f "$BACKEND/package.json" ]; then
+            echo "BLOCKED" > audit-results/backend-discovery.status
             exit 0
           fi
 
-          cd "$ROOT"
+          cd "$BACKEND"
+
+          node <<'NODE' > "$GITHUB_WORKSPACE/audit-results/backend-scripts.json"
+          const fs = require("fs");
+
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const scripts = pkg.scripts || {};
+
+          console.log(JSON.stringify({
+            packageName: pkg.name || null,
+            version: pkg.version || null,
+            scripts
+          }, null, 2));
+          NODE
+
+          {
+            echo "=== package.json ==="
+            cat package.json
+
+            echo
+            echo "=== SCRIPT NAMES ==="
+            npm run
+          } > "$GITHUB_WORKSPACE/audit-results/backend-discovery.log" 2>&1
+
+          echo "PASS" > "$GITHUB_WORKSPACE/audit-results/backend-discovery.status"
+
+      - name: Install backend dependencies
+        shell: bash
+        run: |
+          set +e
+
+          BACKEND="$(cat audit-results/BACKEND_ROOT.txt 2>/dev/null)"
+
+          if [ -z "$BACKEND" ] || [ ! -d "$BACKEND" ]; then
+            echo "BLOCKED" > audit-results/backend-install.status
+            exit 0
+          fi
+
+          cd "$BACKEND"
+
+          if [ -f package-lock.json ]; then
+            npm ci \
+              > "$GITHUB_WORKSPACE/audit-results/backend-install.log" 2>&1
+          else
+            npm install \
+              > "$GITHUB_WORKSPACE/audit-results/backend-install.log" 2>&1
+          fi
+
+          RC=$?
+
+          echo "EXIT_CODE=$RC" \
+            >> "$GITHUB_WORKSPACE/audit-results/backend-install.log"
+
+          if [ "$RC" -eq 0 ]; then
+            echo "PASS" > "$GITHUB_WORKSPACE/audit-results/backend-install.status"
+          else
+            echo "FAIL" > "$GITHUB_WORKSPACE/audit-results/backend-install.status"
+          fi
+
+          exit 0
+
+      - name: Run backend test and verification scripts
+        shell: bash
+        run: |
+          set +e
+
+          BACKEND="$(cat audit-results/BACKEND_ROOT.txt 2>/dev/null)"
+
+          if [ -z "$BACKEND" ] || [ ! -d "$BACKEND" ]; then
+            echo "BLOCKED" > audit-results/backend-tests.status
+            exit 0
+          fi
+
+          cd "$BACKEND"
 
           FAILURES=0
           CASES=0
+          BLOCKED=0
 
-          run_case() {
-            NAME="$1"
-            shift
+          SCRIPT_LOG_DIR="$GITHUB_WORKSPACE/audit-results/backend-cases"
+          mkdir -p "$SCRIPT_LOG_DIR"
+
+          run_script() {
+            SCRIPT="$1"
 
             CASES=$((CASES + 1))
 
+            SAFE_NAME="$(echo "$SCRIPT" | tr ':/' '__')"
+            LOG="$SCRIPT_LOG_DIR/$SAFE_NAME.log"
+
             echo
             echo "========================================"
-            echo "CASE: $NAME"
-            echo "COMMAND: $*"
+            echo "BACKEND SCRIPT: $SCRIPT"
             echo "========================================"
 
-            "$@"
+            timeout "${AUDIT_TIMEOUT_MINUTES}m" npm run "$SCRIPT" \
+              > "$LOG" 2>&1
+
             RC=$?
 
-            echo "RESULT: $NAME -> exit $RC"
+            {
+              echo
+              echo "EXIT_CODE=$RC"
+            } >> "$LOG"
+
+            echo "RESULT=$RC" >> "$SCRIPT_LOG_DIR/$SAFE_NAME.status"
 
             if [ "$RC" -ne 0 ]; then
               FAILURES=$((FAILURES + 1))
@@ -294,106 +478,115 @@ jobs:
             return 0
           }
 
+          if [ ! -f package.json ]; then
+            echo "BLOCKED" > "$GITHUB_WORKSPACE/audit-results/backend-tests.status"
+            exit 0
+          fi
+
+          mapfile -t SCRIPTS < <(
+            node -e '
+              const p=require("./package.json");
+              for (const k of Object.keys(p.scripts||{}).sort()) console.log(k);
+            '
+          )
+
+          for SCRIPT in "${SCRIPTS[@]}"; do
+
+            case "$SCRIPT" in
+              test|test:*|check|check:*|verify|verify:*|lint|lint:*|audit|audit:*|contract|contract:*|product|product:*|security|security:*|resilience|resilience:*|backup|backup:*|restore|restore:*|staging|staging:*|postgres|postgres:*|provider|provider:*|failure|failure:*|integration|integration:*|e2e|e2e:*)
+                run_script "$SCRIPT"
+                ;;
+            esac
+
+          done
+
           {
-            if [ -f package.json ]; then
-
-              run_case "npm-ci" npm ci --ignore-scripts
-
-              if npm run 2>/dev/null | grep -qE '(^|[[:space:]])check($|[[:space:]])'; then
-                run_case "npm-check" npm run check
-              fi
-
-              if npm run 2>/dev/null | grep -qE '(^|[[:space:]])test($|[[:space:]])'; then
-                run_case "npm-test" npm test
-              fi
-
-              if npm run 2>/dev/null | grep -q 'test:contract'; then
-                run_case "npm-test-contract" npm run test:contract
-              fi
-
-              if npm run 2>/dev/null | grep -q 'test:product'; then
-                run_case "npm-test-product" npm run test:product
-              fi
-
-              if npm run 2>/dev/null | grep -q 'check:all'; then
-                run_case "npm-check-all" npm run check:all
-              fi
-
-              run_case "npm-audit" npm audit --audit-level=high
-
-            else
-              echo "No package.json found."
-            fi
-
-            echo
             echo "TOTAL_CASES=$CASES"
             echo "TOTAL_FAILURES=$FAILURES"
-          } > "$GITHUB_WORKSPACE/audit-results/backend.log" 2>&1
+            echo "TOTAL_BLOCKED=$BLOCKED"
+          } > "$GITHUB_WORKSPACE/audit-results/backend-tests-summary.txt"
 
-          if [ "$FAILURES" -eq 0 ]; then
-            echo "PASS" > "$GITHUB_WORKSPACE/audit-results/backend.status"
+          if [ "$CASES" -eq 0 ]; then
+            echo "BLOCKED" > "$GITHUB_WORKSPACE/audit-results/backend-tests.status"
+          elif [ "$FAILURES" -eq 0 ]; then
+            echo "PASS" > "$GITHUB_WORKSPACE/audit-results/backend-tests.status"
           else
-            echo "FAIL" > "$GITHUB_WORKSPACE/audit-results/backend.status"
+            echo "FAIL" > "$GITHUB_WORKSPACE/audit-results/backend-tests.status"
           fi
 
           exit 0
 
-      - name: Localization and UX checks
+      - name: Backend npm audit
         shell: bash
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
+          BACKEND="$(cat audit-results/BACKEND_ROOT.txt 2>/dev/null)"
 
-          {
-            echo "========================================"
-            echo "LOCALIZATION / UX DISCOVERY"
-            echo "========================================"
+          if [ -z "$BACKEND" ] || [ ! -d "$BACKEND" ]; then
+            echo "BLOCKED" > audit-results/backend-security.status
+            exit 0
+          fi
 
-            find "$ROOT" \
-              -type f \
-              \( -name '*.dart' -o -name '*.yaml' -o -name '*.json' \) \
-              | sort | head -n 2000
+          cd "$BACKEND"
 
-            echo
-            echo "========================================"
-            echo "LOCALIZATION REFERENCES"
-            echo "========================================"
+          npm audit --audit-level=high \
+            > "$GITHUB_WORKSPACE/audit-results/backend-npm-audit.log" 2>&1
 
-            grep -RInE \
-              'gen-l10n|localization|locale|supportedLocales|arb' \
-              "$ROOT" 2>/dev/null | head -n 500
+          RC=$?
 
-          } > audit-results/localization-ux.log 2>&1
+          echo "EXIT_CODE=$RC" \
+            >> "$GITHUB_WORKSPACE/audit-results/backend-npm-audit.log"
 
-          echo "PASS" > audit-results/localization-ux.status
+          if [ "$RC" -eq 0 ]; then
+            echo "PASS" > "$GITHUB_WORKSPACE/audit-results/backend-security.status"
+          else
+            echo "FAIL" > "$GITHUB_WORKSPACE/audit-results/backend-security.status"
+          fi
+
+          exit 0
 
       - name: Android configuration audit
         shell: bash
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
+          ROOT="$(cat audit-results/FLUTTER_ROOT.txt 2>/dev/null)"
+
+          if [ -z "$ROOT" ] || [ ! -d "$ROOT/android" ]; then
+            echo "BLOCKED" > audit-results/android-config.status
+            exit 0
+          fi
 
           {
-            echo "========================================"
-            echo "ANDROID CONFIGURATION"
-            echo "========================================"
+            echo "=== GRADLE FILES ==="
 
             find "$ROOT/android" \
-              -maxdepth 4 \
               -type f \
-              \( -name '*.gradle' -o -name '*.gradle.kts' -o -name 'gradle.properties' -o -name 'AndroidManifest.xml' \) \
-              -print 2>/dev/null
+              \( \
+                -name '*.gradle' \
+                -o -name '*.gradle.kts' \
+                -o -name 'gradle.properties' \
+                -o -name 'AndroidManifest.xml' \
+              \) \
+              -print \
+              | sort
 
             echo
-            echo "========================================"
-            echo "ANDROID VALUES"
-            echo "========================================"
+            echo "=== ANDROID VALUES ==="
 
             grep -RInE \
               'compileSdk|targetSdk|minSdk|namespace|applicationId|ndkVersion|sourceCompatibility|targetCompatibility|jvmTarget' \
-              "$ROOT/android" 2>/dev/null | head -n 500
+              "$ROOT/android" 2>/dev/null \
+              | head -n 1000
+
+            echo
+            echo "=== SIGNING REFERENCES ==="
+
+            grep -RInE \
+              'signingConfigs|storeFile|storePassword|keyAlias|keyPassword|ANDROID_RELEASE|release.*sign' \
+              "$ROOT/android" 2>/dev/null \
+              | head -n 1000
 
           } > audit-results/android-config.log 2>&1
 
@@ -404,180 +597,268 @@ jobs:
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
+          ROOT="$(cat audit-results/FLUTTER_ROOT.txt 2>/dev/null)"
 
           if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
-            echo "BLOCKED" > audit-results/android-build.status
+            echo "BLOCKED" > audit-results/android-release.status
             exit 0
           fi
 
           cd "$ROOT"
 
-          flutter build apk --release \
-            > "$GITHUB_WORKSPACE/audit-results/android-build.log" 2>&1
+          flutter build apk --release --no-pub \
+            > "$GITHUB_WORKSPACE/audit-results/android-release.log" 2>&1
 
           RC=$?
 
           echo "EXIT_CODE=$RC" \
-            >> "$GITHUB_WORKSPACE/audit-results/android-build.log"
+            >> "$GITHUB_WORKSPACE/audit-results/android-release.log"
 
           if [ "$RC" -eq 0 ]; then
 
-            echo "PASS" > "$GITHUB_WORKSPACE/audit-results/android-build.status"
+            echo "PASS" > "$GITHUB_WORKSPACE/audit-results/android-release.status"
 
-            {
-              echo "========================================"
-              echo "APK FILES"
-              echo "========================================"
+            find "$ROOT/build" \
+              -type f \
+              -name '*.apk' \
+              -exec ls -lh {} \; \
+              > "$GITHUB_WORKSPACE/audit-results/apk-files.txt" 2>&1
 
-              find "$ROOT/build" \
-                -type f \
-                -name '*.apk' \
-                -exec ls -lh {} \; 2>/dev/null
-
-              echo
-              echo "========================================"
-              echo "APK SHA256"
-              echo "========================================"
-
-              find "$ROOT/build" \
-                -type f \
-                -name '*.apk' \
-                -exec sha256sum {} \; 2>/dev/null
-
-            } > "$GITHUB_WORKSPACE/audit-results/apk-evidence.txt"
+            find "$ROOT/build" \
+              -type f \
+              -name '*.apk' \
+              -exec sha256sum {} \; \
+              > "$GITHUB_WORKSPACE/audit-results/apk-sha256.txt" 2>&1
 
           else
-            echo "FAIL" > "$GITHUB_WORKSPACE/audit-results/android-build.status"
+
+            if grep -Eqi \
+              'signing|keystore|storeFile|storePassword|keyPassword|ANDROID_RELEASE_STORE_FILE|release signing' \
+              "$GITHUB_WORKSPACE/audit-results/android-release.log"; then
+
+              echo "BLOCKED" > "$GITHUB_WORKSPACE/audit-results/android-release.status"
+
+            else
+
+              echo "FAIL" > "$GITHUB_WORKSPACE/audit-results/android-release.status"
+
+            fi
+
           fi
 
           exit 0
 
-      - name: Workflow consistency audit
+      - name: Android debug build fallback
         shell: bash
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
+          ROOT="$(cat audit-results/FLUTTER_ROOT.txt 2>/dev/null)"
+
+          if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
+            echo "BLOCKED" > audit-results/android-debug.status
+            exit 0
+          fi
+
+          cd "$ROOT"
+
+          flutter build apk --debug --no-pub \
+            > "$GITHUB_WORKSPACE/audit-results/android-debug.log" 2>&1
+
+          RC=$?
+
+          echo "EXIT_CODE=$RC" \
+            >> "$GITHUB_WORKSPACE/audit-results/android-debug.log"
+
+          if [ "$RC" -eq 0 ]; then
+            echo "PASS" > "$GITHUB_WORKSPACE/audit-results/android-debug.status"
+
+            find "$ROOT/build" \
+              -type f \
+              -name '*debug*.apk' \
+              -exec sha256sum {} \; \
+              > "$GITHUB_WORKSPACE/audit-results/android-debug-sha256.txt" 2>&1
+
+          else
+            echo "FAIL" > "$GITHUB_WORKSPACE/audit-results/android-debug.status"
+          fi
+
+          exit 0
+
+      - name: CI workflow audit
+        shell: bash
+        run: |
+          set +e
+
+          ROOT="$(cat audit-results/FLUTTER_ROOT.txt 2>/dev/null)"
 
           {
-            echo "========================================"
-            echo "WORKFLOW FILES"
-            echo "========================================"
+            echo "=== WORKFLOWS ==="
 
             find "$ROOT/.github/workflows" \
               -type f \
               -maxdepth 2 \
-              -print 2>/dev/null
+              -print 2>/dev/null \
+              | sort
 
             echo
-            echo "========================================"
-            echo "FLUTTER REFERENCES"
-            echo "========================================"
+            echo "=== ACTIONS ==="
+
+            grep -RIn 'uses:' \
+              "$ROOT/.github/workflows" 2>/dev/null
+
+            echo
+            echo "=== FLUTTER VERSIONS ==="
 
             grep -RInE \
               'flutter-version|FLUTTER_VERSION' \
               "$ROOT/.github/workflows" 2>/dev/null
 
             echo
-            echo "========================================"
-            echo "JAVA REFERENCES"
-            echo "========================================"
+            echo "=== JAVA VERSIONS ==="
 
             grep -RInE \
               'java-version|JAVA_VERSION' \
               "$ROOT/.github/workflows" 2>/dev/null
 
             echo
-            echo "========================================"
-            echo "ACTION REFERENCES"
-            echo "========================================"
+            echo "=== API / RELEASE SECRETS ==="
 
-            grep -RIn 'uses:' \
+            grep -RInE \
+              'secrets\.|API_BASE_URL|ANDROID_RELEASE|KEYSTORE' \
               "$ROOT/.github/workflows" 2>/dev/null
 
-          } > audit-results/workflow-consistency.log 2>&1
+          } > audit-results/ci-workflow-audit.log 2>&1
 
-          echo "PASS" > audit-results/workflow-consistency.status
+          echo "PASS" > audit-results/ci-workflow-audit.status
 
-      - name: Security scan
+      - name: Security static scan
         shell: bash
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
+          ROOT="$(cat audit-results/FLUTTER_ROOT.txt 2>/dev/null)"
 
           {
-            echo "========================================"
-            echo "POSSIBLE SECRET / CREDENTIAL REFERENCES"
-            echo "========================================"
+            echo "=== PRIVATE KEY PATTERNS ==="
 
             grep -RInE \
               --exclude-dir=.git \
               --exclude='*.lock' \
               --exclude='*.sum' \
-              '(api[_-]?key|secret[_-]?key|private[_-]?key|password|BEGIN RSA PRIVATE KEY|BEGIN OPENSSH PRIVATE KEY)' \
-              "$ROOT" 2>/dev/null | head -n 500
+              'BEGIN (RSA|EC|OPENSSH|DSA|PRIVATE) PRIVATE KEY' \
+              "$ROOT" 2>/dev/null \
+              | head -n 300
 
             echo
-            echo "========================================"
-            echo "GITIGNORE"
-            echo "========================================"
+            echo "=== POSSIBLE CREDENTIAL VARIABLES ==="
+
+            grep -RInE \
+              --exclude-dir=.git \
+              --exclude='*.lock' \
+              --exclude='*.sum' \
+              '(api[_-]?key|secret[_-]?key|client[_-]?secret|password|token|access[_-]?token)' \
+              "$ROOT" 2>/dev/null \
+              | head -n 500
+
+            echo
+            echo "=== GITIGNORE ==="
 
             if [ -f "$ROOT/.gitignore" ]; then
               cat "$ROOT/.gitignore"
             fi
 
-          } > audit-results/security.log 2>&1
+          } > audit-results/security-static.log 2>&1
 
-          echo "REVIEW_REQUIRED" > audit-results/security.status
+          echo "REVIEW_REQUIRED" > audit-results/security-static.status
 
-      - name: Runtime environment detection
+      - name: Runtime environment audit
         shell: bash
         run: |
           set +e
 
-          ROOT="$(cat audit-results/PROJECT_ROOT.txt 2>/dev/null)"
+          ROOT="$(cat audit-results/FLUTTER_ROOT.txt 2>/dev/null)"
 
           {
-            echo "========================================"
-            echo "DOCKER"
-            echo "========================================"
+            echo "=== DOCKER ==="
 
             if command -v docker >/dev/null 2>&1; then
               docker --version
-              echo "Docker available"
+              echo "DOCKER_AVAILABLE=true"
             else
-              echo "Docker unavailable"
+              echo "DOCKER_AVAILABLE=false"
             fi
 
             echo
-            echo "========================================"
-            echo "EMULATORS / DEVICES"
-            echo "========================================"
+            echo "=== ADB ==="
 
             if command -v adb >/dev/null 2>&1; then
+              adb version
               adb devices
+              echo "ADB_AVAILABLE=true"
             else
-              echo "ADB unavailable"
+              echo "ADB_AVAILABLE=false"
             fi
 
             echo
-            echo "========================================"
-            echo "RUNTIME FILES"
-            echo "========================================"
+            echo "=== CONTAINERS / COMPOSE ==="
 
             find "$ROOT" \
-              -maxdepth 4 \
               -type f \
-              \( -name 'docker-compose*.yml' -o -name 'compose*.yml' -o -name 'Dockerfile*' \) \
-              -print 2>/dev/null
+              \( \
+                -name 'Dockerfile' \
+                -o -name 'Dockerfile.*' \
+                -o -name 'docker-compose*.yml' \
+                -o -name 'compose*.yml' \
+              \) \
+              -print 2>/dev/null \
+              | sort
 
-          } > audit-results/runtime-environment.log 2>&1
+          } > audit-results/runtime.log 2>&1
 
-          echo "PASS" > audit-results/runtime-environment.status
+          echo "PASS" > audit-results/runtime.status
 
-      - name: Generate final report
+      - name: Repository reproducibility audit
+        shell: bash
+        run: |
+          set +e
+
+          ROOT="$(cat audit-results/FLUTTER_ROOT.txt 2>/dev/null)"
+
+          {
+            echo "=== LOCK FILES ==="
+
+            find "$ROOT" \
+              -type f \
+              \( \
+                -name 'pubspec.lock' \
+                -o -name 'package-lock.json' \
+                -o -name 'yarn.lock' \
+                -o -name 'pnpm-lock.yaml' \
+              \) \
+              -print \
+              | sort
+
+            echo
+            echo "=== SOURCE ZIP HASH ==="
+
+            cat audit-results/source.log 2>/dev/null
+
+          } > audit-results/reproducibility.log 2>&1
+
+          if [ -f audit-results/pubspec-lock.status ]; then
+            LOCK_RESULT="$(cat audit-results/pubspec-lock.status)"
+          else
+            LOCK_RESULT="BLOCKED"
+          fi
+
+          if [ "$LOCK_RESULT" = "PASS" ]; then
+            echo "PASS" > audit-results/reproducibility.status
+          else
+            echo "BLOCKED" > audit-results/reproducibility.status
+          fi
+
+      - name: Build audit report
         if: always()
         shell: bash
         run: |
@@ -585,85 +866,114 @@ jobs:
 
           REPORT="audit-results/FINAL-AUDIT-REPORT.md"
 
+          get_status() {
+            FILE="audit-results/$1.status"
+
+            if [ -f "$FILE" ]; then
+              cat "$FILE"
+            else
+              echo "NOT_RUN"
+            fi
+          }
+
           {
-            echo "# HOPE Marketplace — Full Audit"
+            echo "# HOPE Marketplace — Complete Audit Report"
             echo
-            echo "## Run Information"
+            echo "## Execution"
             echo
             echo "- Repository: $GITHUB_REPOSITORY"
             echo "- Commit: $GITHUB_SHA"
             echo "- Run ID: $GITHUB_RUN_ID"
             echo "- Workflow: $GITHUB_WORKFLOW"
+            echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "- Flutter: $FLUTTER_VERSION"
             echo "- Java: $JAVA_VERSION"
             echo "- Node: $NODE_VERSION"
-            echo "- UTC: $(date -u)"
             echo
-            echo "## Result Matrix"
-            echo
-            echo "| Area | Result |"
-            echo "|---|---|"
 
-            for area in \
-              source \
-              root \
-              flutter-dependencies \
-              flutter-analyze \
-              flutter-tests \
-              backend \
-              localization-ux \
-              android-config \
-              android-build \
-              workflow-consistency \
-              security \
-              runtime-environment
-            do
-              if [ -f "audit-results/$area.status" ]; then
-                RESULT="$(cat "audit-results/$area.status")"
-              else
-                RESULT="NOT_RUN"
-              fi
-
-              echo "| $area | $RESULT |"
-            done
-
-            echo
             echo "## Source"
             echo
+            cat audit-results/source.log 2>/dev/null || true
+            echo
 
-            if [ -f audit-results/source.log ]; then
-              cat audit-results/source.log
+            echo "## Project Roots"
+            echo
+            echo "Flutter: $(cat audit-results/FLUTTER_ROOT.txt 2>/dev/null || echo NOT_FOUND)"
+            echo "Backend: $(cat audit-results/BACKEND_ROOT.txt 2>/dev/null || echo NOT_FOUND)"
+            echo
+
+            echo "## Result Matrix"
+            echo
+            echo "| Audit Area | Status |"
+            echo "|---|---|"
+            echo "| Source ZIP | $(get_status source) |"
+            echo "| Flutter root | $(get_status flutter-root) |"
+            echo "| Backend root | $(get_status backend-root) |"
+            echo "| Project structure | $(get_status project-structure) |"
+            echo "| pubspec.lock reproducibility | $(get_status pubspec-lock) |"
+            echo "| Flutter dependencies | $(get_status flutter-dependencies) |"
+            echo "| Flutter format | $(get_status flutter-format) |"
+            echo "| Flutter analyze | $(get_status flutter-analyze) |"
+            echo "| Flutter tests | $(get_status flutter-tests) |"
+            echo "| Backend discovery | $(get_status backend-discovery) |"
+            echo "| Backend install | $(get_status backend-install) |"
+            echo "| Backend tests/checks | $(get_status backend-tests) |"
+            echo "| Backend npm audit | $(get_status backend-security) |"
+            echo "| Android configuration | $(get_status android-config) |"
+            echo "| Android release | $(get_status android-release) |"
+            echo "| Android debug fallback | $(get_status android-debug) |"
+            echo "| CI/workflow audit | $(get_status ci-workflow-audit) |"
+            echo "| Security static scan | $(get_status security-static) |"
+            echo "| Runtime environment | $(get_status runtime) |"
+            echo "| Reproducibility | $(get_status reproducibility) |"
+            echo
+
+            echo "## Backend Summary"
+            echo
+            cat audit-results/backend-tests-summary.txt 2>/dev/null || echo "No backend summary."
+            echo
+
+            echo "## Android Summary"
+            echo
+            if [ -f audit-results/apk-files.txt ]; then
+              cat audit-results/apk-files.txt
+            fi
+
+            if [ -f audit-results/apk-sha256.txt ]; then
+              echo
+              cat audit-results/apk-sha256.txt
             fi
 
             echo
-            echo "## Project Root"
+            echo "## Critical Findings"
             echo
 
-            if [ -f audit-results/PROJECT_ROOT.txt ]; then
-              cat audit-results/PROJECT_ROOT.txt
+            if grep -RInE \
+              'already declared|duplicate declaration|Error:|Unhandled exception|BUILD FAILED|Compilation failed' \
+              audit-results 2>/dev/null \
+              | head -n 200; then
+              true
             else
-              echo "Not detected"
+              echo "No matching high-signal failure patterns found in collected logs."
             fi
 
-            echo
-            echo "## Important Interpretation"
-            echo
-            echo "PASS = executed successfully."
-            echo
-            echo "FAIL = executed and reported an error."
-            echo
-            echo "BLOCKED = required source/tooling/runtime was unavailable."
-            echo
-            echo "REVIEW_REQUIRED = requires manual review."
             echo
             echo "## Evidence Files"
             echo
 
             find audit-results \
-              -maxdepth 1 \
               -type f \
-              -printf '%f\n' \
+              -printf '%P\n' \
               | sort
+
+            echo
+            echo "## Status Definitions"
+            echo
+            echo "- PASS = test/check actually executed successfully."
+            echo "- FAIL = test/check executed and failed."
+            echo "- BLOCKED = required prerequisite, secret, service, or reproducibility input was unavailable."
+            echo "- REVIEW_REQUIRED = manual review required."
+            echo "- NOT_RUN = no result was produced."
 
           } > "$REPORT"
 
@@ -674,7 +984,6 @@ jobs:
             echo "  \"repository\": \"$GITHUB_REPOSITORY\","
             echo "  \"commit\": \"$GITHUB_SHA\","
             echo "  \"run_id\": \"$GITHUB_RUN_ID\","
-            echo "  \"workflow\": \"$GITHUB_WORKFLOW\","
             echo "  \"flutter\": \"$FLUTTER_VERSION\","
             echo "  \"java\": \"$JAVA_VERSION\","
             echo "  \"node\": \"$NODE_VERSION\","
@@ -684,11 +993,11 @@ jobs:
 
           cat "$REPORT"
 
-      - name: Upload complete evidence
+      - name: Upload complete audit evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: HOPE-FULL-AUDIT-${{ github.run_number }}
+          name: HOPE-COMPLETE-AUDIT-${{ github.run_number }}
           path: audit-results
           if-no-files-found: warn
           retention-days: 30
@@ -699,35 +1008,67 @@ jobs:
         run: |
           set +e
 
-          FAIL=0
+          HARD_FAIL=0
+          CRITICAL_BLOCKED=0
 
-          REQUIRED_CASES=(
+          FAIL_CASES=(
             "flutter-dependencies"
+            "flutter-format"
             "flutter-analyze"
             "flutter-tests"
-            "backend"
-            "android-build"
+            "backend-install"
+            "backend-tests"
+            "backend-security"
+            "android-config"
+            "android-debug"
           )
 
-          for area in "${REQUIRED_CASES[@]}"; do
-            if [ -f "audit-results/$area.status" ]; then
-              RESULT="$(cat "audit-results/$area.status")"
+          for CASE in "${FAIL_CASES[@]}"; do
+
+            if [ -f "audit-results/$CASE.status" ]; then
+              RESULT="$(cat "audit-results/$CASE.status")"
 
               if [ "$RESULT" = "FAIL" ]; then
-                FAIL=1
+                HARD_FAIL=1
               fi
             fi
+
           done
 
-          echo
-          echo "========================================"
-          echo "HOPE FULL AUDIT FINAL GATE"
-          echo "========================================"
+          if [ -f audit-results/android-release.status ]; then
+            ANDROID_RELEASE_RESULT="$(cat audit-results/android-release.status)"
 
-          if [ "$FAIL" -eq 0 ]; then
-            echo "No executed mandatory case reported FAIL."
-            exit 0
+            if [ "$ANDROID_RELEASE_RESULT" = "FAIL" ]; then
+              HARD_FAIL=1
+            elif [ "$ANDROID_RELEASE_RESULT" = "BLOCKED" ]; then
+              CRITICAL_BLOCKED=1
+            fi
           fi
 
-          echo "One or more mandatory audit cases reported FAIL."
-          exit 1
+          if [ -f audit-results/pubspec-lock.status ]; then
+            if [ "$(cat audit-results/pubspec-lock.status)" = "BLOCKED" ]; then
+              CRITICAL_BLOCKED=1
+            fi
+          fi
+
+          echo
+          echo "=============================================="
+          echo "HOPE COMPLETE AUDIT — FINAL GATE"
+          echo "=============================================="
+          echo
+          echo "HARD_FAIL=$HARD_FAIL"
+          echo "CRITICAL_BLOCKED=$CRITICAL_BLOCKED"
+          echo
+
+          if [ "$HARD_FAIL" -ne 0 ]; then
+            echo "AUDIT RESULT: FAIL"
+            exit 1
+          fi
+
+          if [ "$CRITICAL_BLOCKED" -ne 0 ]; then
+            echo "AUDIT RESULT: BLOCKED / INCOMPLETE"
+            exit 1
+          fi
+
+          echo "AUDIT RESULT: PASS"
+          exit 0
